@@ -1,24 +1,27 @@
 // server.js — SCZN3 SEC Backend (REAL COMPUTE + SIGN FIX)
 // Always JSON (never HTML error pages)
-// POST /api/sec accepts multipart: field "image" + optional fields:
-//   distanceYards (yards), clickValueMoa (MOA/click), targetSizeInches (default 23)
-//   poibX, poibY (inches) OPTIONAL manual override:
-//     - If poibX/poibY are provided, backend uses them instead of computing from image.
 //
-// IMPORTANT FIX:
-// We output CORRECTION clicks (what to dial) = NEGATIVE of POIB offset.
-// If POIB is RIGHT (+), correction is LEFT (-). If POIB is UP (+), correction is DOWN (-).
+// POST /api/sec accepts multipart field "image" + optional fields:
+//   distanceYards (yards)
+//   clickValueMoa (MOA per click)
+//   targetSizeInches (physical target width/height, default 23)
+//   poibX, poibY (inches) OPTIONAL manual override
+//
+// Conventions:
+//   POIB inches:  Right + / Left -   |   Up + / Down -
+//   OUTPUT clicks are CORRECTION clicks (what to dial) = NEGATIVE of POIB offset.
+//     If POIB is RIGHT (+), correction is LEFT (-).
+//     If POIB is UP (+), correction is DOWN (-).
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import sharp from "sharp";
 
-const BUILD_TAG = "REAL_v2_2025-12-26_SIGNFIX";
+const BUILD_TAG = "REAL_v3_2025-12-26_IMAGE_POIB_FIX";
 
 const app = express();
 
-// CORS: allow requests from your Static Site + browser testing
 app.use(
   cors({
     origin: true,
@@ -26,33 +29,27 @@ app.use(
   })
 );
 
-// Always return JSON (avoid Express default HTML errors)
+// Force JSON content-type on everything
 app.use((req, res, next) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   next();
 });
 
-// Multer memory storage (raw bytes in RAM)
+// Multer memory storage
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
 });
 
-// ---------- Helpers ----------
+// ---------------- Helpers ----------------
 function toNumberOrDefault(v, def) {
   if (v === undefined || v === null) return def;
-  const s = String(v).trim();
-  if (!s) return def;
-  const n = Number(s);
+  const n = Number(String(v).trim());
   return Number.isFinite(n) ? n : def;
 }
 
-function hasNumber(v) {
-  if (v === undefined || v === null) return false;
-  const s = String(v).trim();
-  if (!s) return false;
-  const n = Number(s);
-  return Number.isFinite(n);
+function hasKey(obj, key) {
+  return obj && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
 // 1 MOA ≈ 1.047" at 100 yards
@@ -60,98 +57,94 @@ function inchesPerClick(distanceYards, clickValueMoa) {
   return 1.047 * (distanceYards / 100) * clickValueMoa;
 }
 
-function round2(n) {
-  return Math.round(n * 100) / 100;
-}
-
+// For CORRECTION clicks:
+// windage: + = RIGHT, - = LEFT
+// elevation: + = UP, - = DOWN
 function dialText(axisName, clicksSigned) {
   const abs = Math.abs(clicksSigned);
-  const rounded = round2(abs);
+  const rounded = Math.round(abs * 100) / 100;
   if (axisName === "windage") {
-    if (rounded === 0) return "CENTER (0.00 clicks)";
     return clicksSigned >= 0 ? `RIGHT ${rounded} clicks` : `LEFT ${rounded} clicks`;
   }
-  // elevation
-  if (rounded === 0) return "LEVEL (0.00 clicks)";
   return clicksSigned >= 0 ? `UP ${rounded} clicks` : `DOWN ${rounded} clicks`;
 }
 
-// ---------- Image / Compute (simple, robust baseline) ----------
-//
-// Assumptions for v1 REAL compute:
-// - target is mostly square in frame
-// - outer border exists and is the darkest frame
-// - bullet holes are dark blobs on bright background
-// - ignore thick center cross by masking a band around center lines
-//
-// Output: poibInches {x,y} where
-//   x: Right + / Left -
-//   y: Up + / Down -
-//
-async function computePoibFromImage(buffer, targetSizeInches = 23) {
-  // Normalize: resize to max 1100px wide (keeps it fast and consistent)
-  // (If your image is already smaller, it will remain as-is.)
-  const normalized = sharp(buffer).rotate().resize({ width: 1100, withoutEnlargement: true });
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
 
-  // Convert to grayscale raw pixels
-  const { data, info } = await normalized
-    .clone()
+// --------- Image processing + POIB compute ---------
+//
+// Strategy (fast + robust for your target):
+// 1) Normalize to fixed width (default 1100px), rotate to correct EXIF.
+// 2) Convert to grayscale RAW buffer.
+// 3) Detect outer border edges by scanning for heavy dark columns/rows.
+// 4) Compute pixels-per-inch using border width and targetSizeInches.
+// 5) Detect bullet holes as dark connected components,
+//    while masking out the thick center cross and the header band.
+// 6) POIB inches = (groupCenter - targetCenter) / ppi
+//    with Y inverted so Up is positive.
+// 7) CORRECTION clicks = -POIB / inchesPerClick
+
+async function loadNormalizedGrayRaw(buffer, normalizedWidth = 1100) {
+  // rotate() respects EXIF orientation
+  const img = sharp(buffer).rotate();
+
+  const meta = await img.metadata();
+
+  // Resize to fixed width to stabilize detection
+  const resized = img.resize({ width: normalizedWidth });
+
+  // Grayscale raw output
+  const { data, info } = await resized
     .grayscale()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  const w = info.width;
-  const h = info.height;
-
-  // Basic stats (for debug)
+  // Compute gray mean (simple)
   let sum = 0;
   for (let i = 0; i < data.length; i++) sum += data[i];
-  const grayMean = sum / data.length;
+  const grayMean = data.length ? sum / data.length : 0;
 
-  // Border detection thresholds
-  const borderDarkThresh = 60; // border/cross is near black
-  const edgeFrac = 0.01; // % of row/col that must be dark to be considered "border-like"
+  return {
+    origMeta: meta,
+    gray: new Uint8Array(data),
+    w: info.width,
+    h: info.height,
+    grayMean,
+    normalizedWidth: info.width,
+    normalizedHeight: info.height,
+  };
+}
 
-  function rowDarkCount(y) {
-    let c = 0;
+// Find border edges by scanning for columns/rows with strong dark density
+function findBorderEdges(gray, w, h, grayThreshold) {
+  const isDark = (v) => v < grayThreshold;
+
+  const colDarkFrac = (x) => {
+    let dark = 0;
+    for (let y = 0; y < h; y++) {
+      if (isDark(gray[y * w + x])) dark++;
+    }
+    return dark / h;
+  };
+
+  const rowDarkFrac = (y) => {
+    let dark = 0;
     const rowStart = y * w;
     for (let x = 0; x < w; x++) {
-      if (data[rowStart + x] <= borderDarkThresh) c++;
+      if (isDark(gray[rowStart + x])) dark++;
     }
-    return c;
-  }
+    return dark / w;
+  };
 
-  function colDarkCount(x) {
-    let c = 0;
-    for (let y = 0; y < h; y++) {
-      if (data[y * w + x] <= borderDarkThresh) c++;
-    }
-    return c;
-  }
-
-  // Find outer border by scanning from edges inward
-  const rowMinDark = Math.max(1, Math.floor(w * edgeFrac));
-  const colMinDark = Math.max(1, Math.floor(h * edgeFrac));
-
-  let yT = 0;
-  for (let y = 0; y < h; y++) {
-    if (rowDarkCount(y) >= rowMinDark) {
-      yT = y;
-      break;
-    }
-  }
-
-  let yB = h - 1;
-  for (let y = h - 1; y >= 0; y--) {
-    if (rowDarkCount(y) >= rowMinDark) {
-      yB = y;
-      break;
-    }
-  }
+  // Border lines are very dark and span almost full height/width,
+  // so we look for a column/row where dark fraction exceeds this threshold.
+  const BORDER_FRAC = 0.12;
 
   let xL = 0;
   for (let x = 0; x < w; x++) {
-    if (colDarkCount(x) >= colMinDark) {
+    if (colDarkFrac(x) > BORDER_FRAC) {
       xL = x;
       break;
     }
@@ -159,188 +152,163 @@ async function computePoibFromImage(buffer, targetSizeInches = 23) {
 
   let xR = w - 1;
   for (let x = w - 1; x >= 0; x--) {
-    if (colDarkCount(x) >= colMinDark) {
+    if (colDarkFrac(x) > BORDER_FRAC) {
       xR = x;
       break;
     }
   }
 
-  // Sanity clamp
-  const borderW = Math.max(1, xR - xL);
-  const borderH = Math.max(1, yB - yT);
-
-  // Center (pixel)
-  const centerX = xL + borderW / 2;
-  const centerY = yT + borderH / 2;
-
-  // Pixels per inch using detected border width (target is square)
-  const pixelsPerInch = borderW / Math.max(1, targetSizeInches);
-
-  // Bullet-hole threshold (darker than background but lighter than border)
-  // If mean is very bright, 110 works well. If mean is darker, raise slightly.
-  const holeThresh = grayMean > 220 ? 120 : 135;
-
-  // Mask out thick center cross lines to avoid picking them up as blobs
-  const crossBandPx = Math.max(10, Math.floor(borderW * 0.02)); // about 2% of target width
-
-  function inBorder(x, y) {
-    return x >= xL && x <= xR && y >= yT && y <= yB;
+  let yT = 0;
+  for (let y = 0; y < h; y++) {
+    if (rowDarkFrac(y) > BORDER_FRAC) {
+      yT = y;
+      break;
+    }
   }
 
-  function inCrossBand(x, y) {
-    return Math.abs(x - centerX) <= crossBandPx || Math.abs(y - centerY) <= crossBandPx;
+  let yB = h - 1;
+  for (let y = h - 1; y >= 0; y--) {
+    if (rowDarkFrac(y) > BORDER_FRAC) {
+      yB = y;
+      break;
+    }
   }
 
-  // Connected components on dark pixels inside border, excluding cross band
+  // Safety clamps
+  xL = clamp(xL, 0, w - 2);
+  xR = clamp(xR, xL + 1, w - 1);
+  yT = clamp(yT, 0, h - 2);
+  yB = clamp(yB, yT + 1, h - 1);
+
+  return { xL, xR, yT, yB, borderW: xR - xL, borderH: yB - yT };
+}
+
+// Connected components to find bullet holes (dark blobs), with masks
+function detectHoles(gray, w, h, opts) {
+  const {
+    grayThreshold,
+    xL,
+    xR,
+    yT,
+    yB,
+    centerX,
+    centerY,
+    axisBandPx = 14,     // mask out thick cross
+    headerBandPx = 90,   // mask out title/instruction area at top
+    minArea = 25,
+    maxArea = 5000,
+  } = opts;
+
   const visited = new Uint8Array(w * h);
 
-  const minArea = 25;   // reject tiny noise
-  const maxArea = 3000; // reject huge blobs
-  const margin = 10;    // avoid border edges
+  const isInsideBorder = (x, y) => x >= xL && x <= xR && y >= yT && y <= yB;
+  const isInAxisBand = (x, y) =>
+    Math.abs(x - centerX) <= axisBandPx || Math.abs(y - centerY) <= axisBandPx;
+  const isInHeaderBand = (x, y) => y < yT + headerBandPx;
+
+  const isDark = (x, y) => gray[y * w + x] < grayThreshold;
 
   const holes = [];
 
-  function idx(x, y) {
-    return y * w + x;
-  }
+  // scan only inside border box
+  for (let y = yT; y <= yB; y++) {
+    for (let x = xL; x <= xR; x++) {
+      const idx = y * w + x;
+      if (visited[idx]) continue;
 
-  const qx = new Int32Array(w * h); // worst-case queue (oversized but fast)
-  const qy = new Int32Array(w * h);
+      visited[idx] = 1;
 
-  for (let y = yT + margin; y <= yB - margin; y++) {
-    for (let x = xL + margin; x <= xR - margin; x++) {
-      const i = idx(x, y);
-      if (visited[i]) continue;
+      // Mask regions we never want to treat as holes
+      if (!isInsideBorder(x, y) || isInAxisBand(x, y) || isInHeaderBand(x, y)) continue;
 
-      // Candidate hole pixel?
-      if (!inBorder(x, y) || inCrossBand(x, y) || data[i] > holeThresh) {
-        visited[i] = 1;
-        continue;
-      }
+      if (!isDark(x, y)) continue;
 
-      // BFS flood fill
-      let head = 0;
-      let tail = 0;
-      qx[tail] = x;
-      qy[tail] = y;
-      tail++;
-
-      visited[i] = 1;
-
+      // Flood fill
       let area = 0;
       let sumX = 0;
       let sumY = 0;
-
       let minX = x, maxX = x, minY = y, maxY = y;
 
-      while (head < tail) {
-        const cx = qx[head];
-        const cy = qy[head];
-        head++;
+      const stack = [idx];
+
+      while (stack.length) {
+        const cur = stack.pop();
+        const cy = Math.floor(cur / w);
+        const cx = cur - cy * w;
 
         area++;
         sumX += cx;
         sumY += cy;
-
         if (cx < minX) minX = cx;
         if (cx > maxX) maxX = cx;
         if (cy < minY) minY = cy;
         if (cy > maxY) maxY = cy;
 
         // 4-neighborhood
-        const neigh = [
-          [cx - 1, cy],
-          [cx + 1, cy],
-          [cx, cy - 1],
-          [cx, cy + 1],
-        ];
+        const n1 = cur - 1;
+        const n2 = cur + 1;
+        const n3 = cur - w;
+        const n4 = cur + w;
 
-        for (let k = 0; k < 4; k++) {
-          const nx = neigh[k][0];
-          const ny = neigh[k][1];
-          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
-
-          const ni = idx(nx, ny);
-          if (visited[ni]) continue;
-          visited[ni] = 1;
-
-          if (!inBorder(nx, ny) || inCrossBand(nx, ny)) continue;
-          if (data[ni] > holeThresh) continue;
-
-          qx[tail] = nx;
-          qy[tail] = ny;
-          tail++;
+        // left
+        if (cx > xL && !visited[n1]) {
+          visited[n1] = 1;
+          const nx = cx - 1, ny = cy;
+          if (!isInAxisBand(nx, ny) && !isInHeaderBand(nx, ny) && isDark(nx, ny)) stack.push(n1);
+        }
+        // right
+        if (cx < xR && !visited[n2]) {
+          visited[n2] = 1;
+          const nx = cx + 1, ny = cy;
+          if (!isInAxisBand(nx, ny) && !isInHeaderBand(nx, ny) && isDark(nx, ny)) stack.push(n2);
+        }
+        // up
+        if (cy > yT && !visited[n3]) {
+          visited[n3] = 1;
+          const nx = cx, ny = cy - 1;
+          if (!isInAxisBand(nx, ny) && !isInHeaderBand(nx, ny) && isDark(nx, ny)) stack.push(n3);
+        }
+        // down
+        if (cy < yB && !visited[n4]) {
+          visited[n4] = 1;
+          const nx = cx, ny = cy + 1;
+          if (!isInAxisBand(nx, ny) && !isInHeaderBand(nx, ny) && isDark(nx, ny)) stack.push(n4);
         }
       }
 
-      // Filter component by area and shape
       if (area < minArea || area > maxArea) continue;
 
-      const boxW = maxX - minX + 1;
-      const boxH = maxY - minY + 1;
-
-      // Reject extremely long blobs (usually cross remnants)
-      const aspect = boxW > boxH ? boxW / Math.max(1, boxH) : boxH / Math.max(1, boxW);
-      if (aspect > 6) continue;
+      // Extra filter: very thin text-like blobs often have extreme aspect ratios
+      const bw = maxX - minX + 1;
+      const bh = maxY - minY + 1;
+      const aspect = bw / bh;
+      if (aspect < 0.2 || aspect > 5.0) continue;
 
       const cx = sumX / area;
       const cy = sumY / area;
 
       holes.push({
-        cx,
-        cy,
         area,
-        box: { minX, minY, maxX, maxY, boxW, boxH },
+        bbox: { x1: minX, y1: minY, x2: maxX, y2: maxY, w: bw, h: bh },
+        centerPx: { x: cx, y: cy },
       });
     }
   }
 
-  if (holes.length === 0) {
-    return {
-      ok: false,
-      reason: "NO_HOLES_DETECTED",
-      debug: { w, h, grayMean: round2(grayMean), holeThresh, border: { xL, xR, yT, yB }, pixelsPerInch: round2(pixelsPerInch) },
-    };
-  }
-
-  // POIB = average centroid of detected holes
-  let meanX = 0;
-  let meanY = 0;
-  for (const p of holes) {
-    meanX += p.cx;
-    meanY += p.cy;
-  }
-  meanX /= holes.length;
-  meanY /= holes.length;
-
-  // Convert pixel offset → inches
-  // x: Right+ / Left-
-  const poibX = (meanX - centerX) / pixelsPerInch;
-
-  // y: Up+ / Down-  (pixel Y increases downward)
-  const poibY = (centerY - meanY) / pixelsPerInch;
-
-  return {
-    ok: true,
-    poibInches: { x: round2(poibX), y: round2(poibY) },
-    debug: {
-      w,
-      h,
-      normalizedWidth: w,
-      normalizedHeight: h,
-      grayMean: round2(grayMean),
-      grayThreshold: holeThresh,
-      borderPx: { w: borderW, h: borderH },
-      edges: { xL, xR, yT, yB },
-      centerPx: { x: round2(centerX), y: round2(centerY) },
-      pixelsPerInch: round2(pixelsPerInch),
-      holesDetected: holes.length,
-      holes: holes.slice(0, 25), // cap debug
-    },
-  };
+  return holes;
 }
 
-// ---------- Routes ----------
+function meanPoint(points) {
+  if (!points.length) return null;
+  let sx = 0, sy = 0;
+  for (const p of points) {
+    sx += p.x;
+    sy += p.y;
+  }
+  return { x: sx / points.length, y: sy / points.length };
+}
+
+// ---------------- Routes ----------------
 app.get("/health", (req, res) => {
   res.status(200).send(
     JSON.stringify({
@@ -359,7 +327,7 @@ app.get("/", (req, res) => {
       service: "sczn3-sec-backend-pipe",
       build: BUILD_TAG,
       ts: Date.now(),
-      note: 'Use POST /api/sec (multipart: field "image"). Optional: distanceYards, clickValueMoa, targetSizeInches, poibX, poibY.',
+      note: 'Use POST /api/sec (multipart: field "image" + optional fields).',
     })
   );
 });
@@ -369,7 +337,6 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
   try {
     const file = req.file || null;
 
-    // DEBUG: show exactly what multipart fields arrived
     const debugBody = req.body || {};
     const debugKeys = Object.keys(debugBody || {});
 
@@ -386,35 +353,72 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
       );
     }
 
-    // Read numeric fields (strings in multipart)
+    // Inputs (defaults match your standard)
     const distanceYards = toNumberOrDefault(req.body?.distanceYards, 100);
     const clickValueMoa = toNumberOrDefault(req.body?.clickValueMoa, 0.25);
     const targetSizeInches = toNumberOrDefault(req.body?.targetSizeInches, 23);
 
-    // Manual override (if provided)
-    const manualXProvided = hasNumber(req.body?.poibX);
-    const manualYProvided = hasNumber(req.body?.poibY);
-    const manualOverride = manualXProvided && manualYProvided;
+    // Manual POIB override if either key exists in the multipart body
+    const manualOverride = hasKey(req.body, "poibX") || hasKey(req.body, "poibY");
+    const poibX_manual = toNumberOrDefault(req.body?.poibX, 0);
+    const poibY_manual = toNumberOrDefault(req.body?.poibY, 0);
 
-    let poibX = manualOverride ? toNumberOrDefault(req.body?.poibX, 0) : 0;
-    let poibY = manualOverride ? toNumberOrDefault(req.body?.poibY, 0) : 0;
+    // Image metadata (original)
+    const origMeta = await sharp(file.buffer).metadata();
 
-    // Basic image metadata
-    const meta = await sharp(file.buffer).metadata();
+    // Normalize + grayscale raw
+    const normalizedWidth = 1100;
+    const grayObj = await loadNormalizedGrayRaw(file.buffer, normalizedWidth);
 
-    let computeStatus = "STUB";
-    let detect = null;
+    // Dynamic-ish threshold (works well with your very white background)
+    // If your photos are darker, this will still stay sane.
+    const grayThreshold = clamp(140, 90, 200);
+
+    // Border edges
+    const edges = findBorderEdges(grayObj.gray, grayObj.w, grayObj.h, grayThreshold);
+
+    const centerPx = {
+      x: (edges.xL + edges.xR) / 2,
+      y: (edges.yT + edges.yB) / 2,
+    };
+
+    // Pixels per inch (use width primarily, fall back to avg)
+    const ppiW = edges.borderW / targetSizeInches;
+    const ppiH = edges.borderH / targetSizeInches;
+    const pixelsPerInch = (ppiW + ppiH) / 2;
+
+    // Compute POIB from image if not manual override
+    let poibX = poibX_manual;
+    let poibY = poibY_manual;
+
+    let holes = [];
+    let groupCenterPx = null;
 
     if (!manualOverride) {
-      // Compute POIB from the image
-      const computed = await computePoibFromImage(file.buffer, targetSizeInches);
+      holes = detectHoles(grayObj.gray, grayObj.w, grayObj.h, {
+        grayThreshold,
+        xL: edges.xL,
+        xR: edges.xR,
+        yT: edges.yT,
+        yB: edges.yB,
+        centerX: centerPx.x,
+        centerY: centerPx.y,
+        axisBandPx: 14,
+        headerBandPx: 90,
+        minArea: 25,
+        maxArea: 5000,
+      });
 
-      if (!computed.ok) {
+      // Use mean of detected hole centers (simple + stable for now)
+      const holeCenters = holes.map((h) => h.centerPx);
+      groupCenterPx = meanPoint(holeCenters);
+
+      if (!groupCenterPx) {
+        // If we can't find holes, return a clear JSON error
         return res.status(422).send(
           JSON.stringify({
             ok: false,
-            error: computed.reason || "COMPUTE_FAILED",
-            service: "sczn3-sec-backend-pipe",
+            error: "No bullet holes detected in image.",
             build: BUILD_TAG,
             received: {
               field: file.fieldname,
@@ -423,11 +427,22 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
               bytes: file.size,
             },
             image: {
-              width: meta.width || null,
-              height: meta.height || null,
-              format: meta.format || null,
+              width: origMeta.width || null,
+              height: origMeta.height || null,
+              format: origMeta.format || null,
+              normalizedWidth: grayObj.normalizedWidth,
+              normalizedHeight: grayObj.normalizedHeight,
+              grayThreshold,
+              grayMean: Math.round(grayObj.grayMean * 100) / 100,
             },
-            detect: computed.debug || null,
+            detect: {
+              targetSizeInches,
+              borderPx: { w: edges.borderW, h: edges.borderH },
+              pixelsPerInch: Math.round(pixelsPerInch * 100) / 100,
+              edges: { xL: edges.xL, xR: edges.xR, yT: edges.yT, yB: edges.yB },
+              centerPx,
+              holesDetected: 0,
+            },
             debugBody,
             debugKeys,
             ts: Date.now(),
@@ -435,30 +450,30 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
         );
       }
 
-      poibX = computed.poibInches.x;
-      poibY = computed.poibInches.y;
-      detect = computed.debug;
-      computeStatus = "COMPUTED_FROM_IMAGE";
-    } else {
-      computeStatus = "MANUAL_POIB_OVERRIDE";
+      // POIB inches (Right + / Left -, Up + / Down -)
+      // NOTE: pixel Y increases downward, so Up is (centerY - groupY)
+      poibX = (groupCenterPx.x - centerPx.x) / pixelsPerInch;
+      poibY = (centerPx.y - groupCenterPx.y) / pixelsPerInch;
     }
 
-    // Click computation (CORRECTION = -POIB)
+    // ---- CORRECTION CLICKS (SIGN FIX) ----
+    // what to dial = -POIB / inchesPerClick
     const ipc = inchesPerClick(distanceYards, clickValueMoa);
 
-    // IMPORTANT: correction clicks are NEGATIVE of POIB
-    const windageClicksSigned = ipc === 0 ? 0 : (-poibX / ipc);
-    const elevationClicksSigned = ipc === 0 ? 0 : (-poibY / ipc);
+    const windageClicks = ipc === 0 ? 0 : (-poibX / ipc);
+    const elevationClicks = ipc === 0 ? 0 : (-poibY / ipc);
 
     const clicksSigned = {
-      windage: round2(windageClicksSigned),
-      elevation: round2(elevationClicksSigned),
+      windage: Math.round(windageClicks * 100) / 100,
+      elevation: Math.round(elevationClicks * 100) / 100,
     };
 
     const dial = {
       windage: dialText("windage", clicksSigned.windage),
       elevation: dialText("elevation", clicksSigned.elevation),
     };
+
+    const computeStatus = manualOverride ? "MANUAL_POIB_OVERRIDE" : "COMPUTED_FROM_IMAGE";
 
     return res.status(200).send(
       JSON.stringify({
@@ -474,16 +489,28 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
         },
 
         image: {
-          width: meta.width || null,
-          height: meta.height || null,
-          format: meta.format || null,
-          normalizedWidth: detect?.normalizedWidth ?? null,
-          normalizedHeight: detect?.normalizedHeight ?? null,
-          grayThreshold: detect?.grayThreshold ?? null,
-          grayMean: detect?.grayMean ?? null,
+          width: origMeta.width || null,
+          height: origMeta.height || null,
+          format: origMeta.format || null,
+
+          normalizedWidth: grayObj.normalizedWidth,
+          normalizedHeight: grayObj.normalizedHeight,
+          grayThreshold,
+          grayMean: Math.round(grayObj.grayMean * 100) / 100,
         },
 
-        detect,
+        detect: {
+          targetSizeInches,
+          borderPx: { w: edges.borderW, h: edges.borderH },
+          pixelsPerInch: Math.round(pixelsPerInch * 100) / 100,
+          edges: { xL: edges.xL, xR: edges.xR, yT: edges.yT, yB: edges.yB },
+          centerPx: { x: Math.round(centerPx.x * 10) / 10, y: Math.round(centerPx.y * 10) / 10 },
+          groupCenterPx: groupCenterPx
+            ? { x: Math.round(groupCenterPx.x * 10) / 10, y: Math.round(groupCenterPx.y * 10) / 10 }
+            : null,
+          holesDetected: holes.length,
+          holes: holes.slice(0, 25), // keep response reasonable
+        },
 
         sec: {
           distanceYards,
@@ -491,13 +518,17 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
           targetSizeInches,
           center: { col: "L", row: 12 },
 
-          // Echo POIB (where impacts landed)
-          poibInches: { x: poibX, y: poibY },
+          // POIB used (inches): Right+/Left-, Up+/Down-
+          poibInches: {
+            x: Math.round(poibX * 100) / 100,
+            y: Math.round(poibY * 100) / 100,
+          },
 
-          // Output CORRECTION clicks (what to dial)
+          // CORRECTION clicks (what to dial)
           clicksSigned,
 
           dial,
+
           computeStatus,
         },
 
