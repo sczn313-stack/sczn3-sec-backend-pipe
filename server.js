@@ -1,18 +1,17 @@
 // server.js — SCZN3 SEC Backend (PIPE)
 // Always JSON (never HTML error pages)
-// POST /api/sec accepts multipart field: "image"
+// POST /api/sec accepts multipart: "image" + optional fields:
+// poibXIn, poibYIn, distanceYards, clickValueMoa
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import sharp from "sharp";
 
-const BUILD_TAG = process.env.BUILD_TAG || "PIPE_v1_2025-12-25";
+const BUILD_TAG = "PIPE_v1_2025-12-25b";
 
 const app = express();
 
-// CORS: allow browser calls from your static site + local dev.
-// (Render will set the host; origin:true reflects requesting origin.)
 app.use(
   cors({
     origin: true,
@@ -20,113 +19,161 @@ app.use(
   })
 );
 
-// Basic JSON parsing (doesn't affect multipart uploads)
-app.use(express.json({ limit: "1mb" }));
-
-// Multer in-memory upload (raw bytes in RAM)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
+// Always return JSON
+app.use((req, res, next) => {
+  res.setHeader("Content-Type", "application/json");
+  next();
 });
 
-// --- helpers ---
-function json(res, status, obj) {
-  return res.status(status).json(obj);
-}
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
+});
 
-function moaToClicks(offsetInches, distanceYards, clickValueMoa) {
-  // 1 MOA ≈ 1.047" at 100 yards
-  const inchesPerMoaAtDistance = 1.047 * (distanceYards / 100);
-  const moa = offsetInches / inchesPerMoaAtDistance;
-  const clicks = moa / clickValueMoa;
-  return Number.isFinite(clicks) ? clicks : 0;
-}
-
-// --- routes ---
 app.get("/health", (_req, res) => {
-  return json(res, 200, { ok: true, service: "sczn3-sec-backend-pipe", build: BUILD_TAG, ts: Date.now() });
+  res.status(200).send(
+    JSON.stringify({
+      ok: true,
+      service: "sczn3-sec-backend-pipe",
+      build: BUILD_TAG,
+      ts: Date.now(),
+    })
+  );
 });
 
 app.get("/", (_req, res) => {
-  return json(res, 200, { ok: true, service: "sczn3-sec-backend-pipe", build: BUILD_TAG });
+  res.status(200).send(
+    JSON.stringify({
+      ok: true,
+      service: "sczn3-sec-backend-pipe",
+      build: BUILD_TAG,
+      ts: Date.now(),
+    })
+  );
 });
 
-// Upload endpoint (multipart form-data, field name MUST be "image")
+function num(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+// MOA inches @ yards = 1.047 * (yards/100)
+// moa = inches / moaInchesAtYards
+// clicks = moa / clickValueMoa
+function offsetClicksFromPoib({ poibXIn, poibYIn, distanceYards, clickValueMoa }) {
+  const yards = num(distanceYards, 100);
+  const click = num(clickValueMoa, 0.25);
+
+  const x = num(poibXIn, 0);
+  const y = num(poibYIn, 0);
+
+  const moaInchesAtYards = 1.047 * (yards / 100);
+
+  if (!Number.isFinite(moaInchesAtYards) || moaInchesAtYards <= 0 || click <= 0) {
+    return { windage: 0, elevation: 0 };
+  }
+
+  const moaX = x / moaInchesAtYards;
+  const moaY = y / moaInchesAtYards;
+
+  return {
+    windage: round2(moaX / click),
+    elevation: round2(moaY / click),
+  };
+}
+
+function correctionFromOffset(offset) {
+  // correction is opposite of where the group landed
+  const w = round2(-num(offset.windage, 0));
+  const e = round2(-num(offset.elevation, 0));
+
+  const windageDir = w === 0 ? "None" : w > 0 ? "Right" : "Left";
+  const elevationDir = e === 0 ? "None" : e > 0 ? "Up" : "Down";
+
+  return {
+    windage: { dir: windageDir, clicks: Math.abs(w) },
+    elevation: { dir: elevationDir, clicks: Math.abs(e) },
+    raw: { windage: w, elevation: e }, // signed correction (if you want it)
+  };
+}
+
 app.post("/api/sec", upload.single("image"), async (req, res) => {
   try {
     const file = req.file || null;
 
     if (!file || !file.buffer) {
-      return json(res, 400, {
-        ok: false,
-        error: 'No file uploaded. Use multipart/form-data field name exactly "image".',
-        build: BUILD_TAG,
-      });
+      return res.status(400).send(
+        JSON.stringify({
+          ok: false,
+          error: 'No file uploaded. Use multipart field name "image".',
+          build: BUILD_TAG,
+        })
+      );
     }
 
-    // Read image metadata
+    const poibXIn = num(req.body?.poibXIn, 0);
+    const poibYIn = num(req.body?.poibYIn, 0);
+    const distanceYards = num(req.body?.distanceYards, 100);
+    const clickValueMoa = num(req.body?.clickValueMoa, 0.25);
+
     const meta = await sharp(file.buffer).metadata();
 
-    // Optional: allow quick testing by sending these extra multipart fields:
-    // poibXIn (right +, left -), poibYIn (up +, down -)
-    const distanceYards = Number(req.body?.distanceYards ?? 100);
-    const clickValueMoa = Number(req.body?.clickValueMoa ?? 0.25);
+    const offsetClicks = offsetClicksFromPoib({
+      poibXIn,
+      poibYIn,
+      distanceYards,
+      clickValueMoa,
+    });
 
-    const poibXIn = Number(req.body?.poibXIn ?? 0); // + right
-    const poibYIn = Number(req.body?.poibYIn ?? 0); // + up
+    const correction = correctionFromOffset(offsetClicks);
 
-    // Convert offsets → clicks (stub math; real compute can replace poib values later)
-    const windageClicks = moaToClicks(poibXIn, distanceYards, clickValueMoa);
-    const elevationClicks = moaToClicks(poibYIn, distanceYards, clickValueMoa);
-
-    return json(res, 200, {
-      ok: true,
-      build: BUILD_TAG,
-
-      received: {
-        field: "image",
-        originalname: file.originalname,
-        mimetype: file.mimetype,
-        bytes: file.size,
-      },
-
-      image: {
-        width: meta.width ?? null,
-        height: meta.height ?? null,
-        format: meta.format ?? null,
-      },
-
-      // SEC payload (PIPE stub — ready for real SCZN3 compute to plug in)
-      sec: {
-        distanceYards,
-        clickValueMoa,
-        center: { col: "L", row: 12 }, // SCZN3 default
-        poibInches: { x: poibXIn, y: poibYIn },
-        clicks: {
-          windage: Number(windageClicks.toFixed(2)),
-          elevation: Number(elevationClicks.toFixed(2)),
+    return res.status(200).send(
+      JSON.stringify({
+        ok: true,
+        build: BUILD_TAG,
+        received: {
+          field: "image",
+          originalname: file.originalname,
+          mimetype: file.mimetype,
+          bytes: file.size,
         },
-        computeStatus: "STUB_READY_FOR_REAL_SCZN3_COMPUTE",
-      },
-    });
-  } catch (err) {
-    return json(res, 500, {
-      ok: false,
-      error: "Server error in /api/sec",
-      detail: String(err?.message || err),
-      build: BUILD_TAG,
-    });
+        image: {
+          width: meta.width || null,
+          height: meta.height || null,
+          format: meta.format || null,
+        },
+        sec: {
+          distanceYards,
+          clickValueMoa,
+          center: { col: "L", row: 12 },
+          poibInches: { x: poibXIn, y: poibYIn },
+
+          // keep what you already have
+          offsetClicks,
+
+          // add the shooter-ready output
+          correction,
+
+          computeStatus: "STUB_READY_FOR_REAL_SCZN3_COMPUTE",
+        },
+      })
+    );
+  } catch (e) {
+    return res.status(500).send(
+      JSON.stringify({
+        ok: false,
+        error: String(e?.message || e),
+        build: BUILD_TAG,
+      })
+    );
   }
 });
 
-// 404 (always JSON)
-app.use((req, res) => {
-  return json(res, 404, { ok: false, error: "Not found", path: req.path, build: BUILD_TAG });
-});
-
-// --- start ---
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`[${BUILD_TAG}] listening on :${PORT}`);
+  console.log(`SCZN3 SEC backend listening on ${PORT} | ${BUILD_TAG}`);
 });
