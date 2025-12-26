@@ -1,19 +1,17 @@
 // server.js — SCZN3 SEC Backend (PIPE)
-// Always JSON (never HTML error pages)
-// POST /api/sec accepts multipart:
-//   - file field: "image"
-//   - optional text fields: poibX, poibY, distanceYards, clickValueMoa
+// Always JSON
+// POST /api/sec accepts multipart: "image" + optional fields:
+//   poibX, poibY (inches), distanceYards, clickValueMoa
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import sharp from "sharp";
 
-const BUILD_TAG = "PIPE_v2_2025-12-25";
+const BUILD_TAG = process.env.BUILD_TAG || "PIPE_v3_2025-12-26";
 
 const app = express();
 
-// Allow calls from your Static Site + local dev
 app.use(
   cors({
     origin: true,
@@ -21,17 +19,75 @@ app.use(
   })
 );
 
-// Force JSON responses (even for errors)
+// Force JSON responses
 app.use((req, res, next) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   next();
 });
 
-// Multer in-memory upload
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB
 });
+
+function toNum(v, fallback) {
+  const n = Number(String(v ?? "").trim());
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * Convention:
+ *  poibX > 0 = group right of center
+ *  poibY > 0 = group high (up) of center
+ *
+ * Shooter dial correction is opposite direction:
+ *  Right -> LEFT
+ *  Left  -> RIGHT
+ *  High  -> DOWN
+ *  Low   -> UP
+ */
+function computeSec(poibX, poibY, distanceYards, clickValueMoa) {
+  const inchesPerMOA = 1.047 * (distanceYards / 100);
+  const inchesPerClick = inchesPerMOA * clickValueMoa;
+
+  const windageClicksSigned = inchesPerClick ? round2(poibX / inchesPerClick) : 0;
+  const elevationClicksSigned = inchesPerClick ? round2(poibY / inchesPerClick) : 0;
+
+  const windageDialDir =
+    poibX > 0 ? "LEFT" : poibX < 0 ? "RIGHT" : "NONE";
+  const elevationDialDir =
+    poibY > 0 ? "DOWN" : poibY < 0 ? "UP" : "NONE";
+
+  return {
+    distanceYards,
+    clickValueMoa,
+    poibInches: { x: round2(poibX), y: round2(poibY) },
+
+    // Dev-friendly signed clicks (same sign as poib)
+    clicksSigned: {
+      windage: windageClicksSigned,
+      elevation: elevationClicksSigned,
+    },
+
+    // Shooter-friendly dial instruction
+    dial: {
+      windage: {
+        direction: windageDialDir,
+        clicks: round2(Math.abs(windageClicksSigned)),
+      },
+      elevation: {
+        direction: elevationDialDir,
+        clicks: round2(Math.abs(elevationClicksSigned)),
+      },
+    },
+
+    computeStatus: "DIAL_DIRECTIONS_READY",
+  };
+}
 
 app.get("/health", (_req, res) => {
   res.status(200).send(
@@ -44,53 +100,9 @@ app.get("/health", (_req, res) => {
   );
 });
 
-app.get("/", (_req, res) => {
-  res.status(200).send(
-    JSON.stringify({
-      ok: true,
-      service: "sczn3-sec-backend-pipe",
-      build: BUILD_TAG,
-      note: "Use POST /api/sec (multipart: image + optional poib fields).",
-    })
-  );
-});
-
-function toNum(v, fallback) {
-  const n = Number(String(v ?? "").trim());
-  return Number.isFinite(n) ? n : fallback;
-}
-
-/**
- * Click math used by your current UI:
- * inchesPerMOA = 1.047 * (distanceYards / 100)
- * inchesPerClick = inchesPerMOA * clickValueMoa
- * clicks = poibInches / inchesPerClick
- *
- * (This matches your example: 1.00 @100yd, 0.25MOA => 3.82 clicks)
- */
-function computeClicks({ poibX, poibY, distanceYards, clickValueMoa }) {
-  const inchesPerMOA = 1.047 * (distanceYards / 100);
-  const inchesPerClick = inchesPerMOA * clickValueMoa;
-
-  if (!Number.isFinite(inchesPerClick) || inchesPerClick === 0) {
-    return { windage: 0, elevation: 0 };
-  }
-
-  const windage = Number((poibX / inchesPerClick).toFixed(2));
-  const elevation = Number((poibY / inchesPerClick).toFixed(2));
-  return { windage, elevation };
-}
-
 app.post("/api/sec", upload.single("image"), async (req, res) => {
   try {
     const file = req.file || null;
-
-    // Read optional text fields
-    const poibX = toNum(req.body?.poibX, 0);
-    const poibY = toNum(req.body?.poibY, 0);
-    const distanceYards = toNum(req.body?.distanceYards, 100);
-    const clickValueMoa = toNum(req.body?.clickValueMoa, 0.25);
-
     if (!file || !file.buffer) {
       return res.status(400).send(
         JSON.stringify({
@@ -101,14 +113,16 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
       );
     }
 
-    // Image metadata (safe + fast)
-    const meta = await sharp(file.buffer).metadata();
+    const poibX = toNum(req.body?.poibX, 0);
+    const poibY = toNum(req.body?.poibY, 0);
+    const distanceYards = toNum(req.body?.distanceYards, 100);
+    const clickValueMoa = toNum(req.body?.clickValueMoa, 0.25);
 
-    const clicks = computeClicks({ poibX, poibY, distanceYards, clickValueMoa });
+    const meta = await sharp(file.buffer).metadata();
+    const sec = computeSec(poibX, poibY, distanceYards, clickValueMoa);
 
     return res.status(200).send(
       JSON.stringify({
-        httpStatus: 200,
         ok: true,
         build: BUILD_TAG,
         received: {
@@ -118,18 +132,11 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
           bytes: file.size,
         },
         image: {
-          width: meta.width ?? null,
-          height: meta.height ?? null,
-          format: meta.format ?? null,
+          width: meta.width || null,
+          height: meta.height || null,
+          format: meta.format || null,
         },
-        sec: {
-          distanceYards,
-          clickValueMoa,
-          center: { col: "L", row: 12 },
-          poibInches: { x: poibX, y: poibY },
-          clicks,
-          computeStatus: "STUB_READY_FOR_REAL_SCZN3_COMPUTE",
-        },
+        sec,
       })
     );
   } catch (err) {
@@ -137,8 +144,7 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
       JSON.stringify({
         ok: false,
         build: BUILD_TAG,
-        error: "Server error",
-        details: String(err?.message || err),
+        error: String(err?.message || err),
       })
     );
   }
@@ -146,6 +152,5 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`SCZN3 SEC backend pipe listening on :${PORT} (${BUILD_TAG})`);
+  console.log(`SCZN3 SEC backend listening on ${PORT} (${BUILD_TAG})`);
 });
