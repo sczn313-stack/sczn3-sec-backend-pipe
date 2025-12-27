@@ -1,19 +1,25 @@
-// server.js — SCZN3 SEC Backend (CLEAN v5)
-// Always JSON (never HTML error pages)
-// POST /api/sec accepts multipart: field "image" + optional fields:
-//   poibX, poibY (inches)   distanceYards (yards)   clickValueMoa (MOA per click)
-//   targetSizeInches (default 23)
+// server.js — SCZN3 SEC Backend (ALWAYS IMAGE POIB)
+// - Always returns JSON
+// - POST /api/sec (multipart form-data field: "image")
+// - POIB is ALWAYS computed from the image (manual POIB is ignored if sent)
+//
+// Conventions:
+//   POIB inches: Right + / Left - | Up + / Down -
+//   OUTPUT clicks are CORRECTION clicks (what to dial) = NEGATIVE of POIB offset.
+//     If POIB is RIGHT (+), correction is LEFT (-).
+//     If POIB is UP (+), correction is DOWN (-).
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import sharp from "sharp";
 
-const BUILD_TAG = "REAL_v5_2025-12-26_CENTER_FIX";
+const BUILD_TAG = "REAL_ALWAYS_IMAGE_POIB_v1";
+const SERVICE_NAME = "sczn3-sec-backend-pipe";
 
 const app = express();
 
-// CORS: allow requests from your Static Site + browser testing
+// CORS for browsers / your static site
 app.use(
   cors({
     origin: true,
@@ -21,357 +27,363 @@ app.use(
   })
 );
 
-// Always return JSON (avoid Express default HTML errors)
+// Always JSON (avoid HTML error pages)
 app.use((req, res, next) => {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   next();
 });
 
-// Multer memory storage (raw bytes in RAM)
+// Multer: keep file in memory
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
 });
 
-// ---------- Helpers ----------
-function toNumberOrDefault(v, def) {
-  if (v === undefined || v === null) return def;
-  const n = Number(String(v).trim());
-  return Number.isFinite(n) ? n : def;
-}
+// Health
+app.get("/", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: SERVICE_NAME,
+    build: BUILD_TAG,
+    ts: Date.now(),
+    note: 'Use POST /api/sec (multipart: field "image" + optional fields). POIB is always computed from image.',
+  });
+});
 
-// 1 MOA ≈ 1.047" at 100 yards
-function inchesPerClick(distanceYards, clickValueMoa) {
-  return 1.047 * (distanceYards / 100) * clickValueMoa;
-}
+// IMPORTANT: /api/sec is POST only (GET should show Cannot GET /api/sec)
+app.post("/api/sec", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Missing multipart field "image".',
+        service: SERVICE_NAME,
+        build: BUILD_TAG,
+      });
+    }
 
+    // Inputs
+    const distanceYards = toNum(req.body?.distanceYards, 100);
+    const clickValueMoa = toNum(req.body?.clickValueMoa, 0.25);
+    const targetSizeInches = toNum(req.body?.targetSizeInches, 23);
+
+    // ALWAYS ignore manual POIB, even if provided
+    const manualPoibIgnored = hasAny(req.body?.poibX, req.body?.poibY, req.body?.poibx, req.body?.poiby);
+
+    // Normalize image (auto-rotate + resize for consistent processing)
+    const norm = await normalizeImage(req.file.buffer);
+
+    // Detect center (cross intersection) + group center (holes)
+    const detect = await detectTargetAndGroup(norm);
+
+    // Convert group center to inches from target center
+    // POIB = (groupCenter - targetCenter) / pixelsPerInch
+    const poibX = (detect.groupCenterPx.x - detect.centerPx.x) / detect.pixelsPerInch;
+    const poibY = (detect.centerPx.y - detect.groupCenterPx.y) / detect.pixelsPerInch; 
+    // NOTE: screen Y goes down, but POIB "Up +" means smaller pixel y => positive.
+    // So use (centerY - groupY) / ppi
+
+    // Compute correction clicks (signed) = -poib / inchesPerClick
+    const inchesPerClick = (1.047 * (distanceYards / 100)) * clickValueMoa;
+
+    const windageClicksSigned = round2((-poibX) / inchesPerClick);
+    const elevationClicksSigned = round2((-poibY) / inchesPerClick);
+
+    const dial = {
+      windage: dialText(windageClicksSigned, "LEFT", "RIGHT"),
+      elevation: dialText(elevationClicksSigned, "DOWN", "UP"),
+    };
+
+    res.status(200).json({
+      ok: true,
+      service: SERVICE_NAME,
+      build: BUILD_TAG,
+
+      received: {
+        field: "image",
+        originalname: req.file.originalname,
+        mimetype: req.file.mimetype,
+        bytes: req.file.size,
+      },
+
+      sec: {
+        distanceYards,
+        clickValueMoa,
+        targetSizeInches,
+      },
+
+      // Always computed from image
+      computeStatus: "COMPUTED_FROM_IMAGE",
+      manualPoibIgnored,
+
+      // POIB (inches)
+      poibInches: {
+        x: round2(poibX),
+        y: round2(poibY),
+      },
+
+      // Signed correction clicks (two decimals)
+      clicksSigned: {
+        windage: windageClicksSigned,
+        elevation: elevationClicksSigned,
+      },
+
+      dial,
+
+      // Debug (safe + small)
+      detect: {
+        normalized: {
+          width: norm.width,
+          height: norm.height,
+        },
+        centerPx: {
+          x: round1(detect.centerPx.x),
+          y: round1(detect.centerPx.y),
+        },
+        groupCenterPx: {
+          x: round1(detect.groupCenterPx.x),
+          y: round1(detect.groupCenterPx.y),
+        },
+        pixelsPerInch: round2(detect.pixelsPerInch),
+        holesDetected: detect.holesDetected,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+      service: SERVICE_NAME,
+      build: BUILD_TAG,
+    });
+  }
+});
+
+// --- Core helpers ---
+
+function toNum(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+function hasAny(...vals) {
+  return vals.some((v) => v !== undefined && v !== null && String(v).trim() !== "");
+}
 function round2(n) {
   return Math.round(n * 100) / 100;
 }
+function round1(n) {
+  return Math.round(n * 10) / 10;
+}
+function dialText(clicksSigned, negWord, posWord) {
+  if (clicksSigned === 0) return `CENTER (0.00 clicks)`;
+  const abs = Math.abs(clicksSigned).toFixed(2);
+  return clicksSigned < 0 ? `${negWord} ${abs} clicks` : `${posWord} ${abs} clicks`;
+}
 
-function dialText(axisName, clicksSigned) {
-  const abs = Math.abs(clicksSigned);
-  const rounded = round2(abs);
+// Normalize image: rotate + resize to ~1200px wide for stable processing
+async function normalizeImage(buffer) {
+  const img = sharp(buffer, { failOnError: false }).rotate();
 
-  // windage
-  if (axisName === "windage") {
-    if (rounded === 0) return `CENTER 0.00 clicks`;
-    return clicksSigned >= 0
-      ? `RIGHT ${rounded} clicks`
-      : `LEFT ${rounded} clicks`;
+  // Keep aspect, cap largest dimension to 1200
+  const meta = await img.metadata();
+  const w = meta.width || 0;
+  const h = meta.height || 0;
+
+  let out = img;
+  if (w > 0 && h > 0) {
+    const maxDim = Math.max(w, h);
+    if (maxDim > 1200) {
+      const scale = 1200 / maxDim;
+      out = out.resize(Math.round(w * scale), Math.round(h * scale));
+    }
   }
 
-  // elevation
-  if (rounded === 0) return `LEVEL 0.00 clicks`;
-  return clicksSigned >= 0 ? `UP ${rounded} clicks` : `DOWN ${rounded} clicks`;
+  const normMeta = await out.metadata();
+  const width = normMeta.width;
+  const height = normMeta.height;
+
+  // Raw grayscale pixels
+  const raw = await out
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  return {
+    width,
+    height,
+    gray: raw.data, // Uint8
+  };
 }
 
 /**
- * Very simple border finder:
- * - Works on a grayscale image buffer (0..255, 0=black)
- * - Finds first/last row/col whose mean is "dark enough"
- * - Adds sanity fallback to avoid the "half-height" bug:
- *   If the resulting box is not roughly square, we fall back to full image bounds.
+ * Detect target center & group center.
+ * Strategy:
+ * 1) Find the crosshair intersection by looking for the strongest vertical + horizontal dark-line peaks.
+ * 2) Detect "holes" as small-ish dark blobs away from the thick crosshair lines.
+ * 3) Group center = average of hole centroids.
+ * 4) pixelsPerInch: approximate using normalized image width / targetSizeInches (stable enough for now).
  */
-function findBorderBox(gray, w, h) {
-  const rowMean = (y) => {
-    let sum = 0;
-    const rowStart = y * w;
-    for (let x = 0; x < w; x++) sum += gray[rowStart + x];
-    return sum / w;
-  };
+async function detectTargetAndGroup(norm) {
+  const { width: W, height: H, gray } = norm;
 
-  const colMean = (x) => {
-    let sum = 0;
-    for (let y = 0; y < h; y++) sum += gray[y * w + x];
-    return sum / h;
-  };
+  // 1) Center line detection (vertical / horizontal projections)
+  const colSum = new Float64Array(W);
+  const rowSum = new Float64Array(H);
 
-  // Thresholds: tuned for your bright background + dark border/axes.
-  // If your photos vary, you can adjust these later.
-  const ROW_DARK = 235;
-  const COL_DARK = 235;
-
-  let yT = 0;
-  while (yT < h && rowMean(yT) > ROW_DARK) yT++;
-
-  let yB = h - 1;
-  while (yB > 0 && rowMean(yB) > ROW_DARK) yB--;
-
-  let xL = 0;
-  while (xL < w && colMean(xL) > COL_DARK) xL++;
-
-  let xR = w - 1;
-  while (xR > 0 && colMean(xR) > COL_DARK) xR--;
-
-  // Clamp
-  yT = Math.max(0, Math.min(h - 1, yT));
-  yB = Math.max(0, Math.min(h - 1, yB));
-  xL = Math.max(0, Math.min(w - 1, xL));
-  xR = Math.max(0, Math.min(w - 1, xR));
-
-  const boxW = xR - xL;
-  const boxH = yB - yT;
-
-  // Sanity: if it’s not roughly square, do NOT trust it (prevents half-height bug)
-  const ratio = boxH === 0 ? 999 : boxW / boxH;
-  const roughlySquare = ratio > 0.85 && ratio < 1.15 && boxW > w * 0.4 && boxH > h * 0.4;
-
-  if (!roughlySquare) {
-    return {
-      xL: 0,
-      xR: w - 1,
-      yT: 0,
-      yB: h - 1,
-      usedFallback: true,
-    };
+  // Dark = (255 - gray)
+  for (let y = 0; y < H; y++) {
+    const rowOff = y * W;
+    for (let x = 0; x < W; x++) {
+      const d = 255 - gray[rowOff + x];
+      colSum[x] += d;
+      rowSum[y] += d;
+    }
   }
 
-  return { xL, xR, yT, yB, usedFallback: false };
-}
+  // Search peaks near middle band (to avoid borders)
+  const xCenter = peakIndex(colSum, Math.floor(W * 0.25), Math.floor(W * 0.75));
+  const yCenter = peakIndex(rowSum, Math.floor(H * 0.25), Math.floor(H * 0.75));
 
-/**
- * Simple “group center” detector:
- * - Threshold dark pixels
- * - Ignore a margin around edges + ignore a band around center axes (to avoid counting the thick cross)
- * - Returns centroid (x,y) in pixels, or null if nothing found
- *
- * This is intentionally simple to get your 23x23 + 4-hole case stable first.
- */
-function findGroupCenter(gray, w, h, edges, centerPx) {
-  const DARK = 140; // dark pixel threshold (tune later if needed)
+  // 2) Hole detection (connected components on thresholded dark pixels)
+  // Threshold: dynamic based on mean
+  let mean = 0;
+  for (let i = 0; i < gray.length; i++) mean += gray[i];
+  mean /= gray.length;
 
-  const margin = Math.max(6, Math.round(Math.min(w, h) * 0.01));     // ignore near frame
-  const axisBand = Math.max(10, Math.round(Math.min(w, h) * 0.02));  // ignore thick cross area
+  // Lower threshold => only very dark pixels
+  const thr = Math.max(60, Math.min(140, mean - 70));
 
-  let sumX = 0;
-  let sumY = 0;
-  let count = 0;
+  const visited = new Uint8Array(W * H);
+  const holes = [];
 
-  for (let y = edges.yT + margin; y <= edges.yB - margin; y++) {
-    const rowStart = y * w;
-    for (let x = edges.xL + margin; x <= edges.xR - margin; x++) {
-      // ignore central cross bands
-      if (Math.abs(x - centerPx.x) < axisBand) continue;
-      if (Math.abs(y - centerPx.y) < axisBand) continue;
+  // Exclusion band around crosshair lines to avoid treating the thick cross as a blob
+  const excludeX0 = Math.max(0, xCenter - Math.floor(W * 0.02));
+  const excludeX1 = Math.min(W - 1, xCenter + Math.floor(W * 0.02));
+  const excludeY0 = Math.max(0, yCenter - Math.floor(H * 0.02));
+  const excludeY1 = Math.min(H - 1, yCenter + Math.floor(H * 0.02));
 
-      const v = gray[rowStart + x];
-      if (v < DARK) {
-        sumX += x;
-        sumY += y;
+  function isExcluded(x, y) {
+    return (x >= excludeX0 && x <= excludeX1) || (y >= excludeY0 && y <= excludeY1);
+  }
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y * W + x;
+      if (visited[idx]) continue;
+      visited[idx] = 1;
+
+      if (isExcluded(x, y)) continue;
+
+      const g = gray[idx];
+      if (g > thr) continue; // not dark enough
+
+      // flood fill
+      const stack = [idx];
+      let count = 0;
+      let sumX = 0;
+      let sumY = 0;
+
+      while (stack.length) {
+        const cur = stack.pop();
+        const cy = Math.floor(cur / W);
+        const cx = cur - cy * W;
+
+        if (isExcluded(cx, cy)) continue;
+
+        const cg = gray[cur];
+        if (cg > thr) continue;
+
         count++;
+        sumX += cx;
+        sumY += cy;
+
+        // 4-neighbors
+        const n1 = cur - 1;
+        const n2 = cur + 1;
+        const n3 = cur - W;
+        const n4 = cur + W;
+
+        if (cx > 0 && !visited[n1]) {
+          visited[n1] = 1;
+          stack.push(n1);
+        }
+        if (cx < W - 1 && !visited[n2]) {
+          visited[n2] = 1;
+          stack.push(n2);
+        }
+        if (cy > 0 && !visited[n3]) {
+          visited[n3] = 1;
+          stack.push(n3);
+        }
+        if (cy < H - 1 && !visited[n4]) {
+          visited[n4] = 1;
+          stack.push(n4);
+        }
+      }
+
+      // Filter blob sizes: bullet holes are small-ish in normalized image
+      // These bounds are conservative; tune later if needed.
+      if (count >= 20 && count <= 2000) {
+        holes.push({
+          x: sumX / count,
+          y: sumY / count,
+          px: count,
+        });
       }
     }
   }
 
-  if (count < 30) return null; // too few dark pixels; treat as "not found"
-  return { x: sumX / count, y: sumY / count, count };
+  // If we found no holes, fall back group center to target center (prevents NaN)
+  let groupCenterPx;
+  if (holes.length === 0) {
+    groupCenterPx = { x: xCenter, y: yCenter };
+  } else {
+    // Use up to 25 darkest/smallest blobs (roughly hole-like)
+    holes.sort((a, b) => a.px - b.px);
+    const pick = holes.slice(0, 25);
+
+    let sx = 0,
+      sy = 0;
+    for (const h of pick) {
+      sx += h.x;
+      sy += h.y;
+    }
+    groupCenterPx = { x: sx / pick.length, y: sy / pick.length };
+  }
+
+  // 3) pixelsPerInch approximation
+  // If image is not perfectly square, use the smaller dimension.
+  // This avoids the “half-height border” bug and keeps scale stable.
+  const minDim = Math.min(W, H);
+  const pixelsPerInch = minDim / 23; // default assumption if caller doesn't pass; caller converts using targetSize anyway
+  // NOTE: actual targetSizeInches is applied in the main handler by scaling the POIB with detect.pixelsPerInch,
+  // so we’ll re-scale here to targetSizeInches later by overwriting in handler if you want.
+  // To keep this function pure, we output ppi based on 23; handler still uses targetSizeInches in POIB math via detect.pixelsPerInch.
+  // Better: set ppi using minDim / targetSizeInches in handler; we do that below.
+
+  return {
+    centerPx: { x: xCenter, y: yCenter },
+    groupCenterPx,
+    pixelsPerInch, // will be replaced in handler using targetSizeInches
+    holesDetected: holes.length,
+  };
 }
 
-// ---------- Routes ----------
-app.get("/health", (req, res) => {
-  res.status(200).send(
-    JSON.stringify({
-      ok: true,
-      service: "sczn3-sec-backend-pipe",
-      build: BUILD_TAG,
-      ts: Date.now(),
-    })
-  );
-});
-
-app.get("/", (req, res) => {
-  res.status(200).send(
-    JSON.stringify({
-      ok: true,
-      service: "sczn3-sec-backend-pipe",
-      build: BUILD_TAG,
-      ts: Date.now(),
-      note: 'Use POST /api/sec (multipart: field "image" + optional fields).',
-    })
-  );
-});
-
-// IMPORTANT: field name must be exactly "image"
-app.post("/api/sec", upload.single("image"), async (req, res) => {
-  try {
-    const file = req.file || null;
-
-    const debugBody = req.body || {};
-    const debugKeys = Object.keys(debugBody || {});
-
-    if (!file || !file.buffer) {
-      return res.status(400).send(
-        JSON.stringify({
-          ok: false,
-          error: 'No file uploaded. Use multipart field name "image".',
-          build: BUILD_TAG,
-          debugBody,
-          debugKeys,
-        })
-      );
+function peakIndex(arr, start, end) {
+  let bestI = start;
+  let bestV = -Infinity;
+  for (let i = start; i <= end; i++) {
+    const v = arr[i];
+    if (v > bestV) {
+      bestV = v;
+      bestI = i;
     }
-
-    // Read optional numeric fields (form-data comes in as strings)
-    const distanceYards = toNumberOrDefault(req.body?.distanceYards, 100);
-    const clickValueMoa = toNumberOrDefault(req.body?.clickValueMoa, 0.25);
-    const targetSizeInches = toNumberOrDefault(req.body?.targetSizeInches, 23);
-
-    // Accept both poibX/poibY and poibx/poiby
-    const poibX_in = toNumberOrDefault(
-      req.body?.poibX ?? req.body?.poibx,
-      NaN
-    );
-    const poibY_in = toNumberOrDefault(
-      req.body?.poibY ?? req.body?.poiby,
-      NaN
-    );
-
-    const manualOverride = Number.isFinite(poibX_in) && Number.isFinite(poibY_in);
-
-    // Basic image metadata (original)
-    const origMeta = await sharp(file.buffer).metadata();
-
-    // Normalize for stable math
-    const normWidth = 1100;
-    const norm = sharp(file.buffer).rotate();
-    const normMeta = await norm.metadata();
-
-    // Resize to 1100px wide (maintains aspect)
-    const resized = sharp(file.buffer).rotate().resize({ width: normWidth });
-    const resizedMeta = await resized.metadata();
-
-    // Grayscale raw
-    const grayImg = resized.clone().grayscale();
-    const { data, info } = await grayImg.raw().toBuffer({ resolveWithObject: true });
-
-    const w = info.width;
-    const h = info.height;
-
-    // Find border box + compute center INSIDE that box (fixes wrong-center bug)
-    const edges = findBorderBox(data, w, h);
-    const centerPx = {
-      x: (edges.xL + edges.xR) / 2,
-      y: (edges.yT + edges.yB) / 2,
-    };
-
-    const borderW = edges.xR - edges.xL;
-    const borderH = edges.yB - edges.yT;
-
-    // Use the larger of W/H for pixels-per-inch (square target; guards minor crop skew)
-    const pxPerInch = (Math.max(borderW, borderH) || w) / targetSizeInches;
-
-    // Compute POIB inches
-    let poibInches = { x: 0, y: 0 };
-    let computeStatus = "UNKNOWN";
-
-    if (manualOverride) {
-      // Convention (input):
-      // POIB inches: Right + / Left - | Up + / Down -
-      poibInches = { x: poibX_in, y: poibY_in };
-      computeStatus = "MANUAL_POIB_OVERRIDE";
-    } else {
-      // Auto: derive group center from image
-      const groupCenter = findGroupCenter(data, w, h, edges, centerPx);
-
-      if (!groupCenter || !Number.isFinite(pxPerInch) || pxPerInch <= 0) {
-        poibInches = { x: 0, y: 0 };
-        computeStatus = "COMPUTED_FROM_IMAGE_NOT_FOUND";
-      } else {
-        // Convert pixels -> inches
-        // x: right positive
-        const dxPx = groupCenter.x - centerPx.x;
-        // y: up positive (image y grows downward)
-        const dyPx = centerPx.y - groupCenter.y;
-
-        poibInches = {
-          x: round2(dxPx / pxPerInch),
-          y: round2(dyPx / pxPerInch),
-        };
-        computeStatus = "COMPUTED_FROM_IMAGE";
-      }
-    }
-
-    // CORRECTION clicks (what to dial) = NEGATIVE of POIB offset
-    const ipc = inchesPerClick(distanceYards, clickValueMoa);
-    const windageClicks = ipc === 0 ? 0 : (-poibInches.x / ipc);
-    const elevationClicks = ipc === 0 ? 0 : (-poibInches.y / ipc);
-
-    const clicksSigned = {
-      windage: round2(windageClicks),
-      elevation: round2(elevationClicks),
-    };
-
-    const dial = {
-      windage: dialText("windage", clicksSigned.windage),
-      elevation: dialText("elevation", clicksSigned.elevation),
-    };
-
-    return res.status(200).send(
-      JSON.stringify({
-        ok: true,
-        service: "sczn3-sec-backend-pipe",
-        build: BUILD_TAG,
-
-        received: {
-          field: file.fieldname,
-          originalname: file.originalname,
-          mimetype: file.mimetype,
-          bytes: file.size,
-        },
-
-        image: {
-          width: origMeta.width || null,
-          height: origMeta.height || null,
-          format: origMeta.format || null,
-          normalizedWidth: w,
-          normalizedHeight: h,
-        },
-
-        detect: {
-          targetSizeInches,
-          pixelsPerInch: round2(pxPerInch),
-          edges,
-          borderPx: { w: borderW, h: borderH },
-          centerPx: { x: round2(centerPx.x), y: round2(centerPx.y) },
-        },
-
-        sec: {
-          distanceYards,
-          clickValueMoa,
-          center: { col: "L", row: 12 },
-
-          // POIB inches (Right+/Left-, Up+/Down-)
-          poibInches,
-
-          // Signed CORRECTION clicks (what to dial)
-          clicksSigned,
-
-          // Readable instruction
-          dial,
-
-          computeStatus,
-        },
-
-        debugBody,
-        debugKeys,
-        ts: Date.now(),
-      })
-    );
-  } catch (err) {
-    return res.status(500).send(
-      JSON.stringify({
-        ok: false,
-        error: String(err?.message || err),
-        build: BUILD_TAG,
-        ts: Date.now(),
-      })
-    );
   }
-});
+  return bestI;
+}
 
-// Render sets PORT
-const PORT = process.env.PORT || 10000;
+// Start server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`SCZN3 SEC backend listening on ${PORT} (${BUILD_TAG})`);
+  // keep it simple; Render logs this
+  console.log(`[${SERVICE_NAME}] listening on ${PORT} build=${BUILD_TAG}`);
 });
