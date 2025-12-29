@@ -1,432 +1,511 @@
-// server.js (ESM)
-// SCZN3 SEC backend: POST /api/sec (multipart field: "image")
-// Returns POIB (inches) + signed clicks + dial labels with CORRECT directions.
-//
-// Direction rules (hard-locked):
-// - POIB left of bull  -> dial RIGHT
-// - POIB right of bull -> dial LEFT
-// - POIB above bull    -> dial DOWN
-// - POIB below bull    -> dial UP
+import React, { useMemo, useState } from "react";
 
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import sharp from "sharp";
+/**
+ * SCZN3 SEC — Upload Test (Congruence Gate + Minimal Scope Clicks)
+ *
+ * Key rules:
+ * - UI computes dial text ONLY from clicksSigned (never trust backend dial strings)
+ * - UI enforces congruence: "what we sent" must match "what backend says it used"
+ * - Always show two decimals
+ */
 
-const app = express();
-app.use(cors());
-
-const upload = multer({ storage: multer.memoryStorage() });
-
-const BUILD_TAG = "SEC_BACKEND_WINDAGE_LOCK_v1";
-const SERVICE_NAME = "sczn3-sec-backend-pipe";
+const DEFAULT_ENDPOINT = "https://sczn3-sec-backend-pipe.onrender.com/api/sec";
 
 function round2(n) {
-  return Math.round(n * 100) / 100;
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "0.00";
+  return (Math.round(x * 100) / 100).toFixed(2);
 }
 
-// TRUE MOA: 1.047" at 100 yards
-function inchesPerClick(distanceYards, clickValueMoa) {
-  return (distanceYards / 100) * 1.047 * clickValueMoa;
+function abs2(n) {
+  return round2(Math.abs(Number(n)));
 }
 
 /**
- * dxIn: +right, -left
- * dyIn: +down,  -up  (IMAGE COORDINATES)
- *
+ * Accepts:
+ * - "11"
+ * - "23"
+ * - "8.5x11" / "8.5×11" / "8.5 x 11"
  * Returns:
- * - clicksSigned.windage: +RIGHT, -LEFT
- * - clicksSigned.elevation: +UP, -DOWN
+ * - ok, spec, long, short, sendInches (long side)  (ALL as Numbers)
  */
-function computeDialFromOffsets(dxIn, dyIn, distanceYards, clickValueMoa) {
-  const ipc = inchesPerClick(distanceYards, clickValueMoa);
+function parseTargetSpec(raw) {
+  const s0 = String(raw ?? "").trim().toLowerCase();
+  const s = s0.replaceAll("×", "x").replaceAll(" ", "");
 
-  const windageClicks = round2(Math.abs(dxIn) / ipc);
-  const elevationClicks = round2(Math.abs(dyIn) / ipc);
+  if (!s) return { ok: false, reason: "EMPTY" };
 
-  const windageDir = dxIn < 0 ? "RIGHT" : dxIn > 0 ? "LEFT" : "CENTER";
-  const elevationDir = dyIn < 0 ? "DOWN" : dyIn > 0 ? "UP" : "CENTER";
-
-  const windageSigned =
-    windageDir === "RIGHT" ? +windageClicks : windageDir === "LEFT" ? -windageClicks : 0;
-
-  const elevationSigned =
-    elevationDir === "UP" ? +elevationClicks : elevationDir === "DOWN" ? -elevationClicks : 0;
-
-  return {
-    clicksSigned: { windage: windageSigned, elevation: elevationSigned },
-    dial: {
-      windage: windageDir === "CENTER" ? "CENTER 0.00 clicks" : `${windageDir} ${windageClicks.toFixed(2)} clicks`,
-      elevation:
-        elevationDir === "CENTER" ? "CENTER 0.00 clicks" : `${elevationDir} ${elevationClicks.toFixed(2)} clicks`,
-    },
-  };
-}
-
-async function normalizeImageBuffer(inputBuffer) {
-  return sharp(inputBuffer).rotate().toColourspace("rgb").jpeg({ quality: 95 }).toBuffer();
-}
-
-function luminance(r, g, b) {
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-}
-
-/**
- * Crop to the "page/target" area by finding non-white pixels.
- * Works well for screenshots and clean scans.
- */
-async function cropToContent(imgBuffer) {
-  const { data, info } = await sharp(imgBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const w = info.width;
-  const h = info.height;
-  const ch = info.channels;
-
-  let minX = w - 1,
-    minY = h - 1,
-    maxX = 0,
-    maxY = 0;
-  let found = false;
-
-  for (let y = 0; y < h; y++) {
-    const row = y * w * ch;
-    for (let x = 0; x < w; x++) {
-      const i = row + x * ch;
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      const a = data[i + 3];
-      if (a < 10) continue;
-
-      const lum = luminance(r, g, b);
-      if (lum < 245) {
-        found = true;
-        if (x < minX) minX = x;
-        if (y < minY) minY = y;
-        if (x > maxX) maxX = x;
-        if (y > maxY) maxY = y;
-      }
-    }
-  }
-
-  if (!found) {
-    return { buffer: imgBuffer, offsetX: 0, offsetY: 0 };
-  }
-
-  const pad = 10;
-  minX = Math.max(0, minX - pad);
-  minY = Math.max(0, minY - pad);
-  maxX = Math.min(w - 1, maxX + pad);
-  maxY = Math.min(h - 1, maxY + pad);
-
-  const cropW = maxX - minX + 1;
-  const cropH = maxY - minY + 1;
-
-  const cropped = await sharp(imgBuffer)
-    .extract({ left: minX, top: minY, width: cropW, height: cropH })
-    .toBuffer();
-
-  return { buffer: cropped, offsetX: minX, offsetY: minY };
-}
-
-/**
- * Connected components on a binary mask.
- * Returns list of components with centroid + bbox + area.
- */
-function connectedComponents(mask, w, h) {
-  const visited = new Uint8Array(w * h);
-  const comps = [];
-
-  const stack = [];
-
-  for (let y = 0; y < h; y++) {
-    const row = y * w;
-    for (let x = 0; x < w; x++) {
-      const idx = row + x;
-      if (!mask[idx] || visited[idx]) continue;
-
-      visited[idx] = 1;
-
-      let area = 0;
-      let sumX = 0;
-      let sumY = 0;
-      let minX = x,
-        maxX = x,
-        minY = y,
-        maxY = y;
-
-      stack.length = 0;
-      stack.push(idx);
-
-      while (stack.length) {
-        const cur = stack.pop();
-        const cy = Math.floor(cur / w);
-        const cx = cur - cy * w;
-
-        area++;
-        sumX += cx;
-        sumY += cy;
-
-        if (cx < minX) minX = cx;
-        if (cx > maxX) maxX = cx;
-        if (cy < minY) minY = cy;
-        if (cy > maxY) maxY = cy;
-
-        const n1 = cur - 1;
-        const n2 = cur + 1;
-        const n3 = cur - w;
-        const n4 = cur + w;
-
-        if (cx > 0 && mask[n1] && !visited[n1]) {
-          visited[n1] = 1;
-          stack.push(n1);
-        }
-        if (cx < w - 1 && mask[n2] && !visited[n2]) {
-          visited[n2] = 1;
-          stack.push(n2);
-        }
-        if (cy > 0 && mask[n3] && !visited[n3]) {
-          visited[n3] = 1;
-          stack.push(n3);
-        }
-        if (cy < h - 1 && mask[n4] && !visited[n4]) {
-          visited[n4] = 1;
-          stack.push(n4);
-        }
-      }
-
-      const cx = sumX / area;
-      const cy = sumY / area;
-
-      comps.push({
-        area,
-        cx,
-        cy,
-        minX,
-        maxX,
-        minY,
-        maxY,
-        bw: maxX - minX + 1,
-        bh: maxY - minY + 1,
-      });
-    }
-  }
-
-  return comps;
-}
-
-/**
- * Detect bullet holes as small dark blobs (works best for clean targets / screenshots).
- */
-async function detectHolesPx(imgBuffer) {
-  const { data, info } = await sharp(imgBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const w = info.width;
-  const h = info.height;
-  const ch = info.channels;
-
-  // Build a binary mask of "dark enough" pixels
-  const mask = new Uint8Array(w * h);
-
-  for (let y = 0; y < h; y++) {
-    const row = y * w * ch;
-    for (let x = 0; x < w; x++) {
-      const i = row + x * ch;
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      const a = data[i + 3];
-      if (a < 10) continue;
-
-      const lum = luminance(r, g, b);
-      if (lum < 80) {
-        mask[y * w + x] = 1;
-      }
-    }
-  }
-
-  const comps = connectedComponents(mask, w, h);
-
-  // Filter to "hole-like" blobs
-  const filtered = comps.filter((c) => {
-    if (c.area < 25) return false;
-    if (c.area > 20000) return false;
-
-    if (c.bw < 4 || c.bh < 4) return false;
-    if (c.bw > 120 || c.bh > 120) return false;
-
-    const aspect = c.bw / c.bh;
-    if (aspect < 0.35 || aspect > 2.85) return false;
-
-    const thinness = Math.min(c.bw, c.bh) / Math.max(c.bw, c.bh);
-    if (thinness < 0.35) return false;
-
-    // avoid border garbage
-    if (c.minX <= 1 || c.minY <= 1 || c.maxX >= w - 2 || c.maxY >= h - 2) return false;
-
-    return true;
-  });
-
-  // Take up to 12 best blobs by area (holes tend to be strong dark blobs)
-  filtered.sort((a, b) => b.area - a.area);
-  const top = filtered.slice(0, 12);
-
-  return { holes: top, width: w, height: h };
-}
-
-/**
- * Bull location in inches for your 8.5x11 Grid v1.
- * If you want a different bull coordinate later, change these two numbers only.
- */
-function bullInchesForSpec(shortSideIn, longSideIn) {
-  // 8.5 x 11 grid v1 bull coordinate (x from left, y from top)
-  if (Math.abs(shortSideIn - 8.5) < 0.01 && Math.abs(longSideIn - 11.0) < 0.01) {
-    return { x: 4.25, y: 5.5 };
-  }
-  return { x: shortSideIn / 2, y: longSideIn / 2 };
-}
-
-/**
- * Main compute from image:
- * - normalize
- * - crop to content
- * - detect holes
- * - compute POIB as average hole centroid
- * - convert to inches using pixelsPerInch
- * - compute correct dial directions using dx/dy signs
- */
-async function computeFromImage(imgBuffer, targetSizeInchesLong) {
-  const normalized = await normalizeImageBuffer(imgBuffer);
-  const cropped = await cropToContent(normalized);
-
-  const { holes, width, height } = await detectHolesPx(cropped.buffer);
-
-  if (!holes.length) {
+  // Numeric-only (11 / 23)
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    if (!Number.isFinite(n) || n <= 0) return { ok: false, reason: "BAD_NUMBER" };
     return {
-      computeStatus: "NO_HOLES_DETECTED",
-      debug: { width, height },
-      poibInches: null,
-      clicksSigned: { windage: 0, elevation: 0 },
-      dial: { windage: "CENTER 0.00 clicks", elevation: "CENTER 0.00 clicks" },
+      ok: true,
+      spec: `${n}`,
+      long: n,
+      short: n,
+      sendInches: n,
     };
   }
 
-  const longDimPx = Math.max(width, height);
-  const shortDimPx = Math.min(width, height);
+  // WxH like 8.5x11
+  const m = s.match(/^(\d+(\.\d+)?)[x](\d+(\.\d+)?)$/);
+  if (!m) return { ok: false, reason: "BAD_FORMAT (use 11, 23, or 8.5x11)" };
 
-  const longSideIn = Number(targetSizeInchesLong || 11);
-  const shortSideIn = round2((shortDimPx / longDimPx) * longSideIn);
-
-  const pixelsPerInch = longDimPx / longSideIn;
-
-  const bullIn = bullInchesForSpec(shortSideIn, longSideIn);
-
-  // Determine bull center in pixels from top-left of cropped image.
-  // If image is portrait, width ~ shortSideIn and height ~ longSideIn.
-  // If landscape, swap mapping.
-  const isLandscape = width >= height;
-
-  const bullPx = isLandscape
-    ? { x: bullIn.y * pixelsPerInch, y: bullIn.x * pixelsPerInch }
-    : { x: bullIn.x * pixelsPerInch, y: bullIn.y * pixelsPerInch };
-
-  // POIB px = average centroid of detected holes
-  let sx = 0;
-  let sy = 0;
-  for (const h1 of holes) {
-    sx += h1.cx;
-    sy += h1.cy;
+  const a = Number(m[1]);
+  const b = Number(m[3]);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) {
+    return { ok: false, reason: "BAD_DIMENSIONS" };
   }
-  const poibPx = { x: sx / holes.length, y: sy / holes.length };
 
-  // Offsets in inches, with IMAGE sign convention:
-  const dxIn = (poibPx.x - bullPx.x) / pixelsPerInch; // +right
-  const dyIn = (poibPx.y - bullPx.y) / pixelsPerInch; // +down
+  const long = Math.max(a, b);
+  const short = Math.min(a, b);
 
   return {
-    computeStatus: "COMPUTED_FROM_IMAGE",
-    debug: {
-      width,
-      height,
-      pixelsPerInch: round2(pixelsPerInch),
-      longSideIn,
-      shortSideIn,
-      holesDetected: holes.length,
-      bullPx: { x: round2(bullPx.x), y: round2(bullPx.y) },
-      poibPx: { x: round2(poibPx.x), y: round2(poibPx.y) },
-    },
-    poibInches: { x: round2(dxIn), y: round2(dyIn) },
+    ok: true,
+    spec: `${a}x${b}`,
+    long,
+    short,
+    sendInches: long, // we send long side as the canonical inches value
   };
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: SERVICE_NAME,
-    build: BUILD_TAG,
-    note: 'POST /api/sec multipart field "image" (plus distanceYards, clickValueMoa, targetSizeInches).',
-  });
-});
+/**
+ * Compute UI dial text from signed correction clicks.
+ * Convention used by your current output:
+ * - negative windage => LEFT
+ * - positive windage => RIGHT
+ * - negative elevation => DOWN
+ * - positive elevation => UP
+ */
+function uiDialFromClicksSigned(clicksSigned) {
+  const w = Number(clicksSigned?.windage);
+  const e = Number(clicksSigned?.elevation);
 
-app.post("/api/sec", upload.single("image"), async (req, res) => {
-  try {
-    if (!req.file?.buffer) {
-      return res.status(400).json({ ok: false, error: 'Missing multipart field: "image"' });
+  const windageDir = !Number.isFinite(w) || w === 0 ? "CENTER" : w < 0 ? "LEFT" : "RIGHT";
+  const elevationDir = !Number.isFinite(e) || e === 0 ? "LEVEL" : e < 0 ? "DOWN" : "UP";
+
+  const windageAbs = !Number.isFinite(w) ? "0.00" : abs2(w);
+  const elevationAbs = !Number.isFinite(e) ? "0.00" : abs2(e);
+
+  return {
+    windageDir,
+    elevationDir,
+    windageAbs,
+    elevationAbs,
+    windageText: `${windageDir} ${windageAbs} clicks`,
+    elevationText: `${elevationDir} ${elevationAbs} clicks`,
+  };
+}
+
+/**
+ * Attempt to parse backend "dial" strings like:
+ * "LEFT 17.51 clicks"
+ * "DOWN 26.79 clicks"
+ */
+function parseBackendDialDir(dialStr) {
+  const s = String(dialStr ?? "").trim().toUpperCase();
+  if (!s) return null;
+  if (s.includes("LEFT")) return "LEFT";
+  if (s.includes("RIGHT")) return "RIGHT";
+  if (s.includes("UP")) return "UP";
+  if (s.includes("DOWN")) return "DOWN";
+  if (s.includes("CENTER")) return "CENTER";
+  if (s.includes("LEVEL")) return "LEVEL";
+  return null;
+}
+
+export default function App() {
+  const [endpoint, setEndpoint] = useState(DEFAULT_ENDPOINT);
+
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState("");
+
+  const [targetSpec, setTargetSpec] = useState("8.5x11");
+  const parsed = useMemo(() => parseTargetSpec(targetSpec), [targetSpec]);
+
+  const [distanceYards, setDistanceYards] = useState("100");
+  const [clickValueMoa, setClickValueMoa] = useState("0.25");
+
+  const [status, setStatus] = useState("");
+  const [resp, setResp] = useState(null);
+  const [showRaw, setShowRaw] = useState(true);
+
+  const [incongruenceLog, setIncongruenceLog] = useState([]);
+
+  function resetOutputs() {
+    setStatus("");
+    setResp(null);
+    setIncongruenceLog([]);
+  }
+
+  function onChooseFile(e) {
+    const f = e.target.files?.[0] || null;
+    setFile(f);
+    resetOutputs();
+
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    if (f) {
+      const u = URL.createObjectURL(f);
+      setPreviewUrl(u);
+    } else {
+      setPreviewUrl("");
+    }
+  }
+
+  async function send() {
+    setIncongruenceLog([]);
+    setResp(null);
+
+    if (!file) {
+      setStatus("Pick an image first.");
+      return;
+    }
+    if (!parsed.ok) {
+      setStatus(`Target size invalid: ${parsed.reason}`);
+      return;
     }
 
-    const distanceYards = Number(req.body.distanceYards ?? 100);
-    const clickValueMoa = Number(req.body.clickValueMoa ?? 0.25);
-    const targetSizeInches = Number(req.body.targetSizeInches ?? 11);
+    const dy = Number(distanceYards);
+    const cv = Number(clickValueMoa);
+    if (!Number.isFinite(dy) || dy <= 0) {
+      setStatus("Distance must be a positive number.");
+      return;
+    }
+    if (!Number.isFinite(cv) || cv <= 0) {
+      setStatus("Click value must be a positive number.");
+      return;
+    }
 
-    const base = await computeFromImage(req.file.buffer, targetSizeInches);
+    const fd = new FormData();
+    fd.append("image", file);
+    fd.append("distanceYards", String(dy));
+    fd.append("clickValueMoa", String(cv));
+    fd.append("targetSizeInches", String(parsed.sendInches)); // canonical (long side)
 
-    // If no POIB, return centered correction.
-    if (!base.poibInches) {
-      return res.json({
-        ok: true,
-        service: SERVICE_NAME,
-        build: BUILD_TAG,
-        received: {
-          field: "image",
-          originalname: req.file.originalname,
-          mimetype: req.file.mimetype,
-          bytes: req.file.size,
-        },
-        sec: { distanceYards, clickValueMoa, targetSizeInches },
-        computeStatus: base.computeStatus,
-        poibInches: null,
-        clicksSigned: { windage: 0, elevation: 0 },
-        dial: { windage: "CENTER 0.00 clicks", elevation: "CENTER 0.00 clicks" },
-        debug: base.debug,
+    setStatus("Uploading…");
+
+    let json;
+    try {
+      const r = await fetch(endpoint, { method: "POST", body: fd });
+      json = await r.json();
+    } catch (err) {
+      setStatus(`Network/parse error: ${String(err)}`);
+      return;
+    }
+
+    setResp(json);
+    setStatus(json?.ok ? "Done." : "Backend returned ok=false.");
+
+    // ---------- Congruence Gate ----------
+    const logs = [];
+
+    const sentTarget = Number(parsed.sendInches);
+    const backendTarget = Number(json?.sec?.targetSizeInches);
+
+    if (Number.isFinite(backendTarget) && Number.isFinite(sentTarget)) {
+      // allow tiny float wiggle
+      if (Math.abs(backendTarget - sentTarget) > 0.01) {
+        logs.push({
+          code: "TARGET_SIZE_INCONGRUENT",
+          sent: sentTarget,
+          backend: backendTarget,
+          fix: "UI must send the same canonical targetSizeInches the backend uses. Do not mix 8.5x11 with 23.",
+        });
+      }
+    }
+
+    // Dial direction congruence:
+    // UI dial should be derived from clicksSigned. Backend dial strings are informational ONLY.
+    const uiDial = uiDialFromClicksSigned(json?.clicksSigned);
+
+    const backendWindDir = parseBackendDialDir(json?.dial?.windage);
+    const backendElevDir = parseBackendDialDir(json?.dial?.elevation);
+
+    // windage: compare only if backend provides it
+    if (backendWindDir && backendWindDir !== uiDial.windageDir) {
+      logs.push({
+        code: "WINDAGE_DIRECTION_INCONGRUENT",
+        uiDial: uiDial.windageDir,
+        backendDial: json?.dial?.windage,
+        clicksSigned: { windage: json?.clicksSigned?.windage },
+        fix: "Do not trust backend dial strings. UI should render direction from clicksSigned only.",
       });
     }
 
-    const dxIn = base.poibInches.x; // +right, -left
-    const dyIn = base.poibInches.y; // +down, -up (IMAGE)
+    // elevation: compare only if backend provides it
+    if (backendElevDir && backendElevDir !== uiDial.elevationDir) {
+      logs.push({
+        code: "ELEVATION_DIRECTION_INCONGRUENT",
+        uiDial: uiDial.elevationDir,
+        backendDial: json?.dial?.elevation,
+        clicksSigned: { elevation: json?.clicksSigned?.elevation },
+        fix: "Do not trust backend dial strings. UI should render direction from clicksSigned only. (Backend dial text likely has a y-axis flip issue.)",
+      });
+    }
 
-    const { clicksSigned, dial } = computeDialFromOffsets(dxIn, dyIn, distanceYards, clickValueMoa);
-
-    return res.json({
-      ok: true,
-      service: SERVICE_NAME,
-      build: BUILD_TAG,
-      received: {
-        field: "image",
-        originalname: req.file.originalname,
-        mimetype: req.file.mimetype,
-        bytes: req.file.size,
-      },
-      sec: { distanceYards, clickValueMoa, targetSizeInches },
-      computeStatus: base.computeStatus,
-      poibInches: base.poibInches,
-      clicksSigned,
-      dial,
-      debug: base.debug,
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    setIncongruenceLog(logs);
   }
-});
 
-const port = Number(process.env.PORT || 10000);
-app.listen(port, () => {
-  console.log(`[${SERVICE_NAME}] listening on ${port} build=${BUILD_TAG}`);
-});
+  const uiDial = useMemo(() => uiDialFromClicksSigned(resp?.clicksSigned), [resp]);
+
+  return (
+    <div style={{ padding: 18, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
+      <div style={{ fontSize: 44, fontWeight: 900, marginBottom: 10 }}>
+        SCZN3 SEC — Upload Test
+      </div>
+
+      <div style={{ marginBottom: 10, opacity: 0.85 }}>
+        Endpoint
+        <input
+          value={endpoint}
+          onChange={(e) => setEndpoint(e.target.value)}
+          style={{
+            width: "100%",
+            padding: 10,
+            fontSize: 16,
+            borderRadius: 10,
+            border: "1px solid #bbb",
+            marginTop: 6,
+          }}
+        />
+        <div style={{ marginTop: 6, fontSize: 14 }}>
+          POST multipart field: <b>image</b>
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 16,
+          alignItems: "start",
+        }}
+      >
+        {/* LEFT */}
+        <div
+          style={{
+            border: "2px solid #111",
+            borderRadius: 14,
+            padding: 14,
+          }}
+        >
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Choose file</div>
+            <input type="file" accept="image/*" onChange={onChooseFile} />
+            {file ? <div style={{ marginTop: 6, opacity: 0.8 }}>{file.name}</div> : null}
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 6 }}>Target Size</div>
+            <div style={{ display: "grid", gridTemplateColumns: "140px 1fr", gap: 10 }}>
+              <select
+                value={targetSpec}
+                onChange={(e) => setTargetSpec(e.target.value)}
+                style={{
+                  padding: 10,
+                  fontSize: 16,
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                }}
+              >
+                <option value="8.5x11">8.5x11</option>
+                <option value="11">11</option>
+                <option value="23">23</option>
+              </select>
+
+              <input
+                value={targetSpec}
+                onChange={(e) => setTargetSpec(e.target.value)}
+                placeholder="8.5x11 or 11 or 23"
+                style={{
+                  padding: 10,
+                  fontSize: 16,
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                }}
+              />
+            </div>
+
+            <div style={{ marginTop: 6, fontSize: 14, opacity: 0.8 }}>
+              {parsed.ok ? (
+                <>
+                  Parsed: spec=<b>{parsed.spec}</b> long=<b>{round2(parsed.long)}</b> short=<b>{round2(parsed.short)}</b>{" "}
+                  → sending targetSizeInches=<b>{round2(parsed.sendInches)}</b>
+                </>
+              ) : (
+                <>
+                  <b>Invalid:</b> {parsed.reason}
+                </>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+            <div>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>Distance (yards)</div>
+              <input
+                value={distanceYards}
+                onChange={(e) => setDistanceYards(e.target.value)}
+                style={{
+                  width: "100%",
+                  padding: 10,
+                  fontSize: 16,
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                }}
+              />
+            </div>
+
+            <div>
+              <div style={{ fontWeight: 800, marginBottom: 6 }}>Click Value (MOA)</div>
+              <input
+                value={clickValueMoa}
+                onChange={(e) => setClickValueMoa(e.target.value)}
+                style={{
+                  width: "100%",
+                  padding: 10,
+                  fontSize: 16,
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                }}
+              />
+            </div>
+          </div>
+
+          <button
+            onClick={send}
+            style={{
+              width: "100%",
+              padding: 16,
+              fontSize: 20,
+              fontWeight: 900,
+              borderRadius: 14,
+              border: "3px solid #2b66ff",
+              background: "#eaf1ff",
+              cursor: "pointer",
+            }}
+          >
+            Send (with Congruence Gate)
+          </button>
+
+          <div style={{ marginTop: 10, fontSize: 16 }}>
+            <b>Status:</b> {status || "—"}
+          </div>
+
+          {/* Minimal Scope Clicks */}
+          {resp?.ok ? (
+            <div
+              style={{
+                marginTop: 12,
+                border: "3px solid #1a8d3a",
+                borderRadius: 14,
+                padding: 14,
+                background: "#f4fff7",
+              }}
+            >
+              <div style={{ fontSize: 22, fontWeight: 900, marginBottom: 8 }}>Scope Clicks (Minimal)</div>
+
+              <div style={{ fontSize: 18, marginBottom: 6 }}>
+                <b>Windage:</b> {uiDial.windageText}
+              </div>
+              <div style={{ fontSize: 18, marginBottom: 10 }}>
+                <b>Elevation:</b> {uiDial.elevationText}
+              </div>
+
+              <div style={{ fontSize: 14, opacity: 0.85, lineHeight: 1.35 }}>
+                clicksSigned: w={round2(resp?.clicksSigned?.windage)}, e={round2(resp?.clicksSigned?.elevation)}{" "}
+                POIB inches: x={round2(resp?.poibInches?.x)}, y={round2(resp?.poibInches?.y)}
+                <br />
+                computeStatus: {String(resp?.computeStatus || "")} &nbsp; backend sec.targetSizeInches:{" "}
+                {round2(resp?.sec?.targetSizeInches)}
+              </div>
+            </div>
+          ) : null}
+
+          {/* Incongruence Log */}
+          {incongruenceLog.length > 0 ? (
+            <div
+              style={{
+                marginTop: 12,
+                border: "3px solid #cc1f1a",
+                borderRadius: 14,
+                padding: 14,
+                background: "#fff5f5",
+              }}
+            >
+              <div style={{ fontSize: 20, fontWeight: 900, marginBottom: 6 }}>Incongruence Log</div>
+              <div style={{ marginBottom: 10, opacity: 0.85 }}>
+                This result was received, but one or more variables are not congruent. Do not trust the output until fixed.
+              </div>
+
+              {incongruenceLog.map((x, idx) => (
+                <div
+                  key={idx}
+                  style={{
+                    border: "1px solid #e3b1b1",
+                    borderRadius: 12,
+                    padding: 12,
+                    background: "#fff",
+                    marginBottom: 10,
+                  }}
+                >
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>{x.code}</div>
+                  <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                    {JSON.stringify(x, null, 2)}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {/* Raw JSON Toggle */}
+          <div style={{ marginTop: 12 }}>
+            <label style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <input type="checkbox" checked={showRaw} onChange={(e) => setShowRaw(e.target.checked)} />
+              <b>Show raw JSON</b>
+            </label>
+          </div>
+        </div>
+
+        {/* RIGHT */}
+        <div>
+          <div style={{ fontWeight: 900, marginBottom: 8 }}>Preview</div>
+
+          <div
+            style={{
+              border: "2px solid #111",
+              borderRadius: 14,
+              overflow: "hidden",
+              background: "#fff",
+            }}
+          >
+            {previewUrl ? (
+              <img src={previewUrl} alt="preview" style={{ width: "100%", height: "auto", display: "block" }} />
+            ) : (
+              <div style={{ padding: 24, opacity: 0.7 }}>Choose an image to preview.</div>
+            )}
+          </div>
+
+          {showRaw && resp ? (
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontWeight: 900, marginBottom: 8 }}>Response</div>
+              <pre
+                style={{
+                  padding: 12,
+                  background: "#111",
+                  color: "#fff",
+                  borderRadius: 12,
+                  overflowX: "auto",
+                  fontSize: 12,
+                }}
+              >
+                {JSON.stringify(resp, null, 2)}
+              </pre>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
