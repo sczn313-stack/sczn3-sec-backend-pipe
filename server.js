@@ -1,224 +1,258 @@
-/* server.js — SCZN3 SEC backend (Bull-locked, UI tolerant)
-   - Accepts targetSizeSpec OR targetSizeInches OR (widthIn,heightIn)
-   - Always returns sec.targetSizeSpec, sec.targetSizeInches (numeric), clicksSigned
-   - GET /api/sec supported (so browser doesn’t show “Cannot GET /api/sec”)
-*/
+'use strict';
 
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const sharp = require('sharp');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }
+});
 
-const SERVICE = "sczn3-sec-backend-pipe";
-const BUILD = "BULL_LOCKED_V2";
+const BUILD = 'BULL_LOCKED_V3';
 
-// ---------- helpers ----------
-function toNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+// Health check
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'sczn3-sec-backend-pipe', status: 'alive', build: BUILD });
+});
+
+function toNum(x, fallback) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function round2(n) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return 0;
-  return Math.round(x * 100) / 100;
+  return Math.round(n * 100) / 100;
 }
 
-function fmt2(n) {
-  return round2(n).toFixed(2);
-}
+function parseTargetSpec(spec) {
+  // Accept "8.5x11", "8.5×11", "8.5X11"
+  if (!spec || typeof spec !== 'string') return null;
+  const s = spec.replace('×', 'x').replace('X', 'x').trim();
+  const parts = s.split('x').map(p => p.trim());
+  if (parts.length !== 2) return null;
 
-// Parse things like "8.5x11", "8.5×11", "8.5 X 11"
-function parseSpec(specRaw) {
-  if (!specRaw) return null;
-  const s = String(specRaw).toLowerCase().replace("×", "x").replace(/\s+/g, "");
-  const m = s.match(/^(\d+(\.\d+)?)x(\d+(\.\d+)?)$/);
-  if (!m) return null;
-  const a = Number(m[1]);
-  const b = Number(m[3]);
+  const a = Number(parts[0]);
+  const b = Number(parts[1]);
   if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return null;
 
-  // keep original orientation as given, but also compute width/height
-  // We treat width = first, height = second (matches UI "8.5x11")
-  return {
-    targetSizeSpec: `${a}x${b}`,
-    widthIn: a,
-    heightIn: b,
-  };
+  // width = smaller? NO: we keep the order as given (spec is usually width x height)
+  return { widthIn: a, heightIn: b };
 }
 
-function inchesPerMOA(distanceYards) {
-  // True MOA: 1.047" at 100y
-  return 1.047 * (distanceYards / 100);
+function inchesPerClick(distanceYards, clickValueMoa) {
+  // True MOA: 1 MOA = 1.047" at 100y
+  const inchesPerMoaAtDistance = 1.047 * (distanceYards / 100);
+  return inchesPerMoaAtDistance * clickValueMoa;
 }
 
-function getBull(widthIn, heightIn) {
-  // Default bull center (works for your 8.5x11 grid test)
-  return { x: widthIn / 2, y: heightIn / 2 };
+function directionFromCorrection(corrX, corrY) {
+  // corrX: + => RIGHT, - => LEFT
+  // corrY: + => UP,    - => DOWN
+  const windage = corrX >= 0 ? 'RIGHT' : 'LEFT';
+  const elevation = corrY >= 0 ? 'UP' : 'DOWN';
+  return { windage, elevation };
 }
 
-// Map a pixel point into inches using the normalized image dimensions.
-function makePxToInMapper(normW, normH, widthIn, heightIn) {
-  const sx = widthIn / normW;
-  const sy = heightIn / normH;
-  return (pt) => ({ x: pt.x * sx, y: pt.y * sy });
+function normalizeToLongSide(buffer, longSidePx) {
+  // Preserve aspect ratio. Long side becomes longSidePx.
+  return sharp(buffer)
+    .rotate() // respect EXIF rotation
+    .metadata()
+    .then(meta => {
+      const w = meta.width || 0;
+      const h = meta.height || 0;
+      if (!w || !h) throw new Error('BAD_IMAGE');
+
+      const longIsWidth = w >= h;
+      const newW = longIsWidth ? longSidePx : Math.round((w / h) * longSidePx);
+      const newH = longIsWidth ? Math.round((h / w) * longSidePx) : longSidePx;
+
+      return sharp(buffer)
+        .rotate()
+        .resize(newW, newH, { fit: 'fill' }) // already computed aspect
+        .grayscale()
+        .raw()
+        .toBuffer({ resolveWithObject: true })
+        .then(({ data, info }) => ({
+          data,
+          width: info.width,
+          height: info.height
+        }));
+    });
 }
 
-/*
-  Minimal “hole” detection fallback:
-  If you already have a real hole-detector wired in elsewhere, keep it.
-  This fallback just returns a single “group center” at the darkest cluster it can find
-  (safe for direction tests). If no detector present, it won’t crash.
-*/
-async function detectHolesFallback(_imageBuffer) {
-  // We don’t add heavy native deps here. This fallback is intentionally conservative:
-  // return empty holes so pipeline still responds gracefully.
-  return { holes: [], normalized: null };
-}
+function findHoles(binary, w, h) {
+  // binary is Uint8Array of 0/1 where 1 = dark pixel (candidate)
+  // Connected components to find blobs; filter out grid lines by aspect ratio.
+  const visited = new Uint8Array(w * h);
+  const holes = [];
 
-// ---------- routes ----------
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: SERVICE, status: "alive", build: BUILD });
-});
+  const idx = (x, y) => y * w + x;
 
-app.get("/api/sec", (req, res) => {
-  res.json({
-    ok: true,
-    service: SERVICE,
-    build: BUILD,
-    usage: "POST multipart/form-data to /api/sec with fields: image, distanceYards, clickValueMoa, targetSizeSpec OR targetSizeInches OR (widthIn,heightIn)",
-  });
-});
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = idx(x, y);
+      if (visited[i]) continue;
+      visited[i] = 1;
+      if (binary[i] !== 1) continue;
 
-app.post("/api/sec", upload.single("image"), async (req, res) => {
-  try {
-    // ---------- input ----------
-    const distanceYards = toNum(req.body.distanceYards) ?? 100;
-    const clickValueMoa = toNum(req.body.clickValueMoa) ?? 0.25;
+      // BFS
+      let qx = [x];
+      let qy = [y];
+      let qh = 0;
 
-    // UI might send:
-    // - targetSizeSpec: "8.5x11"
-    // - OR targetSizeInches: "8.5x11" (string) OR 8.5 (number)
-    // - OR widthIn/heightIn
-    const specA = req.body.targetSizeSpec;
-    const tsi = req.body.targetSizeInches;
+      let count = 0;
+      let sumX = 0;
+      let sumY = 0;
+      let minX = x, maxX = x, minY = y, maxY = y;
 
-    let parsed = parseSpec(specA) || parseSpec(tsi);
+      while (qh < qx.length) {
+        const cx = qx[qh];
+        const cy = qy[qh];
+        qh++;
 
-    let widthIn = parsed?.widthIn ?? toNum(req.body.widthIn);
-    let heightIn = parsed?.heightIn ?? toNum(req.body.heightIn);
+        const ci = idx(cx, cy);
+        if (binary[ci] !== 1) continue;
 
-    // If still missing, hard-default to your current UI selection to stop the BAD_TARGET_SPEC loop
-    if (!Number.isFinite(widthIn) || !Number.isFinite(heightIn) || widthIn <= 0 || heightIn <= 0) {
-      widthIn = 8.5;
-      heightIn = 11;
-      parsed = { targetSizeSpec: "8.5x11", widthIn, heightIn };
+        count++;
+        sumX += cx;
+        sumY += cy;
+        if (cx < minX) minX = cx;
+        if (cx > maxX) maxX = cx;
+        if (cy < minY) minY = cy;
+        if (cy > maxY) maxY = cy;
+
+        // 4-neighborhood
+        const n = [
+          [cx - 1, cy],
+          [cx + 1, cy],
+          [cx, cy - 1],
+          [cx, cy + 1]
+        ];
+
+        for (const [nx, ny] of n) {
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const ni = idx(nx, ny);
+          if (visited[ni]) continue;
+          visited[ni] = 1;
+          if (binary[ni] === 1) {
+            qx.push(nx);
+            qy.push(ny);
+          }
+        }
+      }
+
+      // Filter: too small/too big blobs are not bullet holes
+      if (count < 20) continue;
+      if (count > 6000) continue;
+
+      const bw = (maxX - minX + 1);
+      const bh = (maxY - minY + 1);
+      const aspect = bw > bh ? (bw / bh) : (bh / bw);
+
+      // Grid lines become long skinny blobs; reject those
+      if (aspect > 2.2) continue;
+
+      const cx = sumX / count;
+      const cy = sumY / count;
+
+      holes.push({
+        cx,
+        cy,
+        area: count,
+        bboxW: bw,
+        bboxH: bh
+      });
     }
+  }
 
-    const targetSizeSpec = parsed?.targetSizeSpec || `${widthIn}x${heightIn}`;
+  // Prefer larger blobs (usually actual holes vs tiny specks)
+  holes.sort((a, b) => b.area - a.area);
 
+  // Keep the top 40 candidates to stay stable
+  return holes.slice(0, 40);
+}
+
+function makeBinaryFromRawGray(raw, w, h) {
+  // raw is grayscale bytes 0..255
+  // Threshold: mark dark pixels as 1
+  // We use a conservative threshold; if your paper is darker, raise it slightly.
+  const out = new Uint8Array(w * h);
+
+  // Compute a quick mean to adapt a little
+  let sum = 0;
+  for (let i = 0; i < raw.length; i++) sum += raw[i];
+  const mean = sum / raw.length;
+
+  // Dynamic threshold: base around mean-35, clamp into sensible range
+  let thr = Math.round(mean - 35);
+  if (thr < 60) thr = 60;
+  if (thr > 140) thr = 140;
+
+  for (let i = 0; i < raw.length; i++) {
+    out[i] = (raw[i] <= thr) ? 1 : 0;
+  }
+  return { binary: out, threshold: thr, mean: Math.round(mean) };
+}
+
+app.post('/api/sec', upload.single('image'), async (req, res) => {
+  try {
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({
         ok: false,
-        service: SERVICE,
+        service: 'sczn3-sec-backend-pipe',
         build: BUILD,
-        error: { code: "NO_IMAGE", message: "image file required" },
+        error: { code: 'NO_IMAGE', message: 'image file required' }
       });
     }
 
-    // ---------- normalize / detect ----------
-    // If you have existing detection code in your repo, plug it in here.
-    // For now we keep a safe fallback so the service never crashes.
-    const detect = await detectHolesFallback(req.file.buffer);
+    const distanceYards = toNum(req.body.distanceYards, 100);
+    const clickValueMoa = toNum(req.body.clickValueMoa, 0.25);
 
-    // If your existing pipeline already provides normalized sizes, use them.
-    // Otherwise assume a generic normalized size (UI will still work; direction logic remains stable).
-    const normW = detect.normalized?.width ?? 1000;
-    const normH = detect.normalized?.height ?? 1000;
+    // UI sends targetSizeSpec like "8.5x11"
+    const targetSizeSpec = String(req.body.targetSizeSpec || req.body.targetSize || '').trim();
+    const spec = parseTargetSpec(targetSizeSpec);
 
-    const pxToIn = makePxToInMapper(normW, normH, widthIn, heightIn);
-    const bull = getBull(widthIn, heightIn);
-
-    // If holes exist, compute centroid. If not, return a clear “no holes” response but still echo SEC fields.
-    const holes = Array.isArray(detect.holes) ? detect.holes : [];
-    if (holes.length === 0) {
-      return res.json({
+    if (!spec) {
+      return res.status(400).json({
         ok: false,
-        service: SERVICE,
+        service: 'sczn3-sec-backend-pipe',
         build: BUILD,
-        received: {
-          originalName: req.file.originalname,
-          bytes: req.file.size,
-          mimetype: req.file.mimetype,
-        },
-        sec: {
-          distanceYards,
-          clickValueMoa,
-          targetSizeSpec,
-          widthIn,
-          heightIn,
-          targetSizeInches: round2(widthIn), // numeric echo expected by UI gate
-        },
-        computeStatus: "FAILED_HOLES",
-        error: { code: "HOLES_NOT_FOUND", message: "No bullet holes detected." },
-        detect: {
-          normalized: { width: normW, height: normH },
-          holesDetected: 0,
-          holes: [],
-        },
+        error: { code: 'BAD_TARGET_SPEC', message: 'targetSizeSpec required (ex: 8.5x11)' }
       });
     }
 
-    // Holes in this fallback format should be {cx,cy}. If your real detector gives bbox/area too, keep them.
-    let sx = 0;
-    let sy = 0;
-    for (const h of holes) {
-      sx += Number(h.cx);
-      sy += Number(h.cy);
-    }
-    const groupCenterPx = { x: sx / holes.length, y: sy / holes.length };
-    const groupCenterIn = pxToIn(groupCenterPx);
+    const widthIn = spec.widthIn;
+    const heightIn = spec.heightIn;
 
-    // ---------- “move cluster to bull” logic ----------
-    // POIB = group - bull (Right +, Up + not enforced here; we use correction directly)
-    // Correction = bull - group  (this is the direction you dial to move the group onto the bull)
-    const corrX = bull.x - groupCenterIn.x;
-    const corrY = bull.y - groupCenterIn.y;
+    // Important: UI wants targetSizeInches to be the LONG side for congruence
+    const targetSizeInches = Math.max(widthIn, heightIn);
 
-    // Direction labels (no “sometimes inverted”):
-    const windageDir = corrX >= 0 ? "RIGHT" : "LEFT";
-    const elevDir = corrY >= 0 ? "UP" : "DOWN";
+    // Normalize image with correct aspect ratio (no more 1000x1000 square)
+    const longSidePx = 1200;
+    const norm = await normalizeToLongSide(req.file.buffer, longSidePx);
 
-    // True MOA conversion
-    const inPerClick = inchesPerMOA(distanceYards) / clickValueMoa;
+    // Create binary mask for holes
+    const binInfo = makeBinaryFromRawGray(norm.data, norm.width, norm.height);
+    const holes = findHoles(binInfo.binary, norm.width, norm.height);
 
-    const clicksW = corrX / inPerClick;
-    const clicksE = corrY / inPerClick;
+    // Bull position in inches: dead center of the paper
+    const bull = { x: widthIn / 2, y: heightIn / 2 };
 
-    const clicksSigned = {
-      windage: round2(clicksW),
-      elevation: round2(clicksE),
-    };
-
-    const dial = {
-      windage: `${windageDir} ${fmt2(Math.abs(clicksW))} clicks`,
-      elevation: `${elevDir} ${fmt2(Math.abs(clicksE))} clicks`,
-    };
-
-    // ---------- response ----------
-    return res.json({
+    // Always return clicksSigned, even if holes fail (UI gate requirement)
+    const baseResponse = {
       ok: true,
-      service: SERVICE,
+      service: 'sczn3-sec-backend-pipe',
       build: BUILD,
       received: {
         originalName: req.file.originalname,
         bytes: req.file.size,
-        mimetype: req.file.mimetype,
+        mimetype: req.file.mimetype
       },
       sec: {
         distanceYards,
@@ -226,32 +260,85 @@ app.post("/api/sec", upload.single("image"), async (req, res) => {
         targetSizeSpec,
         widthIn,
         heightIn,
-        targetSizeInches: round2(widthIn), // numeric echo expected by UI gate
+        targetSizeInches
       },
-      computeStatus: "COMPUTED_FROM_IMAGE",
       detect: {
-        normalized: { width: normW, height: normH },
+        normalized: { width: norm.width, height: norm.height },
+        threshold: binInfo.threshold,
+        meanGray: binInfo.mean,
         holesDetected: holes.length,
-        holes,
-      },
+        holes: holes
+      }
+    };
+
+    if (!holes.length) {
+      return res.json({
+        ...baseResponse,
+        computeStatus: 'FAILED_HOLES',
+        error: { code: 'HOLES_NOT_FOUND', message: 'No bullet holes detected. Use a closer, sharper photo with higher contrast.' },
+        clicksSigned: { windage: 0.00, elevation: 0.00 },
+        dial: { windage: 'RIGHT 0.00', elevation: 'UP 0.00' }
+      });
+    }
+
+    // Group center = average of hole centroids (in normalized pixel space)
+    let sx = 0;
+    let sy = 0;
+    for (const h of holes) {
+      sx += h.cx;
+      sy += h.cy;
+    }
+    const groupCenterPx = { x: sx / holes.length, y: sy / holes.length };
+
+    // Map px -> inches (preserve aspect ratio mapping)
+    const xIn = (groupCenterPx.x / norm.width) * widthIn;
+    const yIn = (groupCenterPx.y / norm.height) * heightIn;
+
+    // POIB inches: +x right, +y up (image y goes down, so flip)
+    const poibX = xIn - bull.x;
+    const poibY = -(yIn - bull.y);
+
+    // Correction = move cluster to bull = bull - POIB = -POIB
+    const corrX = -poibX;
+    const corrY = -poibY;
+
+    const ipc = inchesPerClick(distanceYards, clickValueMoa);
+    const windageClicksSigned = corrX / ipc;
+    const elevationClicksSigned = corrY / ipc;
+
+    const dirs = directionFromCorrection(corrX, corrY);
+
+    const wAbs = Math.abs(windageClicksSigned);
+    const eAbs = Math.abs(elevationClicksSigned);
+
+    return res.json({
+      ...baseResponse,
+      computeStatus: 'COMPUTED_FROM_IMAGE',
       bullInches: { x: round2(bull.x), y: round2(bull.y) },
-      groupCenterInches: { x: round2(groupCenterIn.x), y: round2(groupCenterIn.y) },
+      groupCenterInches: { x: round2(xIn), y: round2(yIn) },
+      poibInches: { x: round2(poibX), y: round2(poibY) },
       correctionInches: { x: round2(corrX), y: round2(corrY) },
-      clicksSigned,
-      dial,
+      inchesPerClick: round2(ipc),
+      clicksSigned: {
+        windage: round2(windageClicksSigned),
+        elevation: round2(elevationClicksSigned)
+      },
+      dial: {
+        windage: `${dirs.windage} ${round2(wAbs).toFixed(2)} clicks`,
+        elevation: `${dirs.elevation} ${round2(eAbs).toFixed(2)} clicks`
+      }
     });
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      service: SERVICE,
+      service: 'sczn3-sec-backend-pipe',
       build: BUILD,
-      error: { code: "SERVER_ERROR", message: String(err && err.message ? err.message : err) },
+      error: { code: 'SERVER_ERROR', message: String(err && err.message ? err.message : err) }
     });
   }
 });
 
-// Render port
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`${SERVICE} listening on ${PORT} (${BUILD})`);
+  // no extra logging needed for Render; keep it quiet
 });
