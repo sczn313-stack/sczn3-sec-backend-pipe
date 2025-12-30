@@ -1,32 +1,20 @@
-/**
- * SCZN3 SEC Backend (bull-logic locked)
- *
- * Endpoint:
- *   POST /api/sec   multipart/form-data field: image
- *
- * Inputs (form fields):
- *   distanceYards (number)   default 100
- *   clickValueMoa (number)   default 0.25
- *   targetSizeInches (number) LONG SIDE INCHES (e.g., 11 for 8.5x11, 23 for 23x23) default 11
- *
- * Output conventions (LOCKED):
- *   - POIB inches: x Right +, Left -, y Up +, Down -
- *   - "Dial" directions are determined ONLY by bull logic:
- *       if POIB.x > 0 => dial LEFT
- *       if POIB.x < 0 => dial RIGHT
- *       if POIB.y > 0 => dial DOWN
- *       if POIB.y < 0 => dial UP
- *   - Click magnitudes derived from True MOA:
- *       1 MOA = 1.047" @ 100y
- */
+// server.js — SCZN3 SEC Backend (Bull-locked logic)
+// - Always returns JSON
+// - POST /api/sec (multipart form-data field: "image")
+// - Bull = target center (width/2, height/2)
+// - One and only one Y flip at POIB creation
+// - Correction = bull - POIB  (what to dial)
+// - Dial directions derived ONLY from correction sign
 
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const sharp = require("sharp");
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import sharp from "sharp";
+
+const BUILD_TAG = "BULL_LOCKED_V1";
+const SERVICE_NAME = "sczn3-sec-backend-pipe";
 
 const app = express();
-
 app.use(cors({ origin: true, credentials: false }));
 
 // Always JSON (avoid HTML error pages)
@@ -35,503 +23,376 @@ app.use((req, res, next) => {
   next();
 });
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 12 * 1024 * 1024 }, // 12MB
-});
+const upload = multer({ storage: multer.memoryStorage() });
 
-function num(v, dflt) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : dflt;
+// -----------------------------
+// Helpers
+// -----------------------------
+function n(x, def = NaN) {
+  const v = Number(x);
+  return Number.isFinite(v) ? v : def;
+}
+function round2(x) {
+  const v = Number(x);
+  if (!Number.isFinite(v)) return 0;
+  return Math.round(v * 100) / 100;
+}
+function fmt2(x) {
+  return round2(x).toFixed(2);
 }
 
-function round2(n) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return 0;
-  return Math.round(x * 100) / 100;
-}
-
-function fmt2(n) {
-  return round2(n).toFixed(2);
-}
-
+// TRUE MOA: 1 MOA = 1.047" @ 100y
 function inchesPerMoaAtYards(yards) {
-  // True MOA
-  return 1.047 * (yards / 100);
+  const y = n(yards, NaN);
+  if (!Number.isFinite(y) || y <= 0) return NaN;
+  return 1.047 * (y / 100);
 }
 
-function clamp(v, a, b) {
-  return Math.max(a, Math.min(b, v));
+// Parse target size
+// Accepts: "11", "8.5x11", "8.5×11", "23"
+function parseTargetSpec(raw) {
+  const s = String(raw ?? "").trim().toLowerCase().replaceAll("×", "x");
+  if (!s) return { ok: false, reason: "EMPTY" };
+
+  // If user sends just "11" (meaning 8.5x11)
+  if (s === "11" || s === "8.5x11" || s === "8.5 x 11" || s === "8.5*11") {
+    return { ok: true, kind: "LETTER", widthIn: 8.5, heightIn: 11.0, longIn: 11.0, shortIn: 8.5 };
+  }
+
+  // Square 23x23
+  if (s === "23" || s === "23x23" || s === "23 x 23") {
+    return { ok: true, kind: "SQUARE_23", widthIn: 23.0, heightIn: 23.0, longIn: 23.0, shortIn: 23.0 };
+  }
+
+  // Generic WxH
+  const m = s.match(/^(\d+(\.\d+)?)\s*x\s*(\d+(\.\d+)?)$/);
+  if (m) {
+    const a = n(m[1], NaN);
+    const b = n(m[3], NaN);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) {
+      return { ok: false, reason: "BAD_DIMS" };
+    }
+    const longIn = Math.max(a, b);
+    const shortIn = Math.min(a, b);
+    // Keep orientation as provided: width=a, height=b
+    return { ok: true, kind: "CUSTOM", widthIn: a, heightIn: b, longIn, shortIn };
+  }
+
+  return { ok: false, reason: "UNSUPPORTED_SPEC", detail: s };
 }
 
-/**
- * Connected components on a binary mask (Uint8Array 0/1).
- * Returns components with bbox + area + centroid.
- */
-function findComponents(mask, w, h) {
-  const visited = new Uint8Array(mask.length);
-  const comps = [];
+// Convert pixel (cx,cy) to inches in target space (origin top-left, y down)
+function pxToIn(cx, cy, imgW, imgH, widthIn, heightIn) {
+  return {
+    xIn: (cx / imgW) * widthIn,
+    yIn: (cy / imgH) * heightIn,
+  };
+}
 
-  const idx = (x, y) => y * w + x;
+// Dial direction from correction sign (LOCKED)
+// correctionX > 0 => RIGHT, < 0 => LEFT
+// correctionY > 0 => UP,    < 0 => DOWN
+function dialFromCorrection(clicksX, clicksY) {
+  const wx = n(clicksX, 0);
+  const wy = n(clicksY, 0);
+
+  const wDir = wx > 0 ? "RIGHT" : wx < 0 ? "LEFT" : "CENTER";
+  const eDir = wy > 0 ? "UP" : wy < 0 ? "DOWN" : "LEVEL";
+
+  return {
+    windage: `${wDir} ${fmt2(Math.abs(wx))} clicks`,
+    elevation: `${eDir} ${fmt2(Math.abs(wy))} clicks`,
+  };
+}
+
+// -----------------------------
+// Simple hole detection (for your clean grid test targets)
+// - Finds connected dark blobs
+// - Filters out corners + QR region + too-large blobs
+// -----------------------------
+function detectHolesFromGrayscale(raw, w, h) {
+  // Threshold for "dark"
+  const DARK_T = 85; // lower = stricter; adjust if needed
+  const visited = new Uint8Array(w * h);
+
+  function idx(x, y) {
+    return y * w + x;
+  }
+  function isDark(i) {
+    return raw[i] < DARK_T;
+  }
+
+  const holes = [];
+
+  // Exclusion zones (skip obvious non-holes)
+  const edgePad = Math.floor(Math.min(w, h) * 0.05); // 5% border
+  const qrX0 = Math.floor(w * 0.72);
+  const qrY0 = Math.floor(h * 0.72);
+
+  const MIN_AREA = 25;      // tiny noise
+  const MAX_AREA = 2500;    // excludes fiducials and big blocks
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = idx(x, y);
-      if (!mask[i] || visited[i]) continue;
-
-      // BFS
-      let qx = [x];
-      let qy = [y];
+      if (visited[i]) continue;
       visited[i] = 1;
 
-      let minX = x,
-        maxX = x,
-        minY = y,
-        maxY = y;
-      let area = 0;
-      let sumX = 0,
-        sumY = 0;
+      // skip excluded zones
+      if (x < edgePad || x > w - edgePad || y < edgePad || y > h - edgePad) continue;
+      if (x >= qrX0 && y >= qrY0) continue;
 
-      for (let qi = 0; qi < qx.length; qi++) {
+      if (!isDark(i)) continue;
+
+      // Flood fill component
+      let qx = [x];
+      let qy = [y];
+      let qi = 0;
+
+      let area = 0;
+      let sumX = 0;
+      let sumY = 0;
+
+      let minX = x, maxX = x, minY = y, maxY = y;
+
+      while (qi < qx.length) {
         const cx = qx[qi];
         const cy = qy[qi];
+        qi++;
+
+        const ci = idx(cx, cy);
+
+        // Count pixel
         area++;
         sumX += cx;
         sumY += cy;
-
         if (cx < minX) minX = cx;
         if (cx > maxX) maxX = cx;
         if (cy < minY) minY = cy;
         if (cy > maxY) maxY = cy;
 
-        // 8-neighborhood
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const nx = cx + dx;
-            const ny = cy + dy;
-            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-            const ni = idx(nx, ny);
-            if (!mask[ni] || visited[ni]) continue;
-            visited[ni] = 1;
-            qx.push(nx);
-            qy.push(ny);
-          }
+        // 4-neighbors
+        const nbrs = [
+          [cx - 1, cy],
+          [cx + 1, cy],
+          [cx, cy - 1],
+          [cx, cy + 1],
+        ];
+
+        for (const [nx, ny] of nbrs) {
+          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+          const ni = idx(nx, ny);
+          if (visited[ni]) continue;
+          visited[ni] = 1;
+          if (!isDark(ni)) continue;
+          qx.push(nx);
+          qy.push(ny);
         }
+
+        // Early stop if huge
+        if (area > MAX_AREA) break;
       }
+
+      if (area < MIN_AREA || area > MAX_AREA) continue;
+
+      const bboxW = maxX - minX + 1;
+      const bboxH = maxY - minY + 1;
+
+      // Reject long skinny things (grid lines)
+      const aspect = Math.max(bboxW, bboxH) / Math.max(1, Math.min(bboxW, bboxH));
+      if (aspect > 6) continue;
 
       const cx = sumX / area;
       const cy = sumY / area;
-      comps.push({
-        area,
-        bbox: { x0: minX, y0: minY, x1: maxX, y1: maxY, w: maxX - minX + 1, h: maxY - minY + 1 },
-        c: { x: cx, y: cy },
-      });
+
+      holes.push({ cx, cy, area, bboxW, bboxH });
     }
   }
 
-  return comps;
+  return holes;
 }
 
-/**
- * Pick 4 fiducials (black corner squares) and compute centerPx as their centroid average.
- * Works on the SCZN3 test targets with corner black squares.
- */
-function estimateCenterFromFiducials(comps, w, h) {
-  // Candidates: reasonably large, square-ish, near corners
-  const candidates = comps
-    .map((c) => {
-      const bw = c.bbox.w;
-      const bh = c.bbox.h;
-      const ar = bw / bh;
-      const squarish = ar > 0.6 && ar < 1.4;
-      return { ...c, bw, bh, ar, squarish };
-    })
-    .filter((c) => c.squarish && c.area > 200); // tune if needed
-
-  if (candidates.length < 4) return null;
-
-  const corners = [
-    { name: "tl", x: 0, y: 0 },
-    { name: "tr", x: w - 1, y: 0 },
-    { name: "bl", x: 0, y: h - 1 },
-    { name: "br", x: w - 1, y: h - 1 },
-  ];
-
-  const picked = {};
-
-  for (const corner of corners) {
-    let best = null;
-    let bestD = Infinity;
-
-    for (const c of candidates) {
-      const dx = c.c.x - corner.x;
-      const dy = c.c.y - corner.y;
-      const d2 = dx * dx + dy * dy;
-      if (d2 < bestD) {
-        bestD = d2;
-        best = c;
-      }
-    }
-
-    if (!best) return null;
-    picked[corner.name] = best;
-  }
-
-  const xs = [picked.tl.c.x, picked.tr.c.x, picked.bl.c.x, picked.br.c.x];
-  const ys = [picked.tl.c.y, picked.tr.c.y, picked.bl.c.y, picked.br.c.y];
-
-  const centerPx = {
-    x: xs.reduce((a, b) => a + b, 0) / xs.length,
-    y: ys.reduce((a, b) => a + b, 0) / ys.length,
-  };
-
-  return { centerPx, fiducials: picked };
-}
-
-/**
- * Basic outlier rejection:
- * If we have >=4 holes, pick the tightest 70% cluster and average it.
- */
-function tightClusterAverage(points) {
-  if (points.length <= 3) {
-    const sx = points.reduce((a, p) => a + p.x, 0);
-    const sy = points.reduce((a, p) => a + p.y, 0);
-    return { x: sx / points.length, y: sy / points.length, used: points.length };
-  }
-
-  const n = points.length;
-  const k = Math.max(3, Math.ceil(n * 0.7));
-
-  // precompute distances
-  const d = Array.from({ length: n }, () => Array(n).fill(0));
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      const dx = points[i].x - points[j].x;
-      const dy = points[i].y - points[j].y;
-      const dist = Math.hypot(dx, dy);
-      d[i][j] = dist;
-      d[j][i] = dist;
-    }
-  }
-
-  let bestSet = null;
-  let bestScore = Infinity;
-
-  // Try each point as an anchor: choose k-1 nearest neighbors
-  for (let i = 0; i < n; i++) {
-    const neighbors = [];
-    for (let j = 0; j < n; j++) {
-      if (j === i) continue;
-      neighbors.push({ j, dist: d[i][j] });
-    }
-    neighbors.sort((a, b) => a.dist - b.dist);
-
-    const idxs = [i, ...neighbors.slice(0, k - 1).map((x) => x.j)];
-
-    // score = sum pairwise distances
-    let score = 0;
-    for (let a = 0; a < idxs.length; a++) {
-      for (let b = a + 1; b < idxs.length; b++) {
-        score += d[idxs[a]][idxs[b]];
-      }
-    }
-
-    if (score < bestScore) {
-      bestScore = score;
-      bestSet = idxs;
-    }
-  }
-
-  const usedPoints = bestSet.map((i) => points[i]);
-  const sx = usedPoints.reduce((a, p) => a + p.x, 0);
-  const sy = usedPoints.reduce((a, p) => a + p.y, 0);
-  return { x: sx / usedPoints.length, y: sy / usedPoints.length, used: usedPoints.length };
-}
-
-/**
- * Detect dark blobs (holes) in a "light grid" target.
- * This is tuned for your SCZN3 test images (scribbles/hole marks).
- */
-function detectHolesFromImage(gray, w, h, excludeBoxes = []) {
-  // Build a binary mask of "dark" pixels.
-  // Threshold is conservative; grid lines are light so they should not trigger heavily.
-  const mask = new Uint8Array(w * h);
-
-  // Quick global threshold by sampling brightness
-  // (0 = black, 255 = white)
-  let sum = 0;
-  const step = Math.max(1, Math.floor((w * h) / 50000));
-  for (let i = 0; i < gray.length; i += step) sum += gray[i];
-  const mean = sum / Math.ceil(gray.length / step);
-
-  // threshold = mean - 45 (clamped)
-  const thr = clamp(Math.round(mean - 45), 40, 200);
-
-  const inExcluded = (x, y) => {
-    for (const b of excludeBoxes) {
-      if (x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1) return true;
-    }
-    return false;
-  };
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (inExcluded(x, y)) continue;
-      if (gray[i] < thr) mask[i] = 1;
-    }
-  }
-
-  const comps = findComponents(mask, w, h);
-
-  // Filter components for hole-like blobs
-  // (not tiny noise, not giant regions)
-  const holes = comps
-    .map((c) => {
-      const bw = c.bbox.w;
-      const bh = c.bbox.h;
-      const aspect = bw / bh;
-      return { ...c, bw, bh, aspect };
-    })
-    .filter((c) => c.area >= 120 && c.area <= 12000)
-    .filter((c) => c.bw >= 6 && c.bh >= 6)
-    .filter((c) => c.aspect > 0.25 && c.aspect < 4.0)
-    // avoid edge garbage
-    .filter((c) => c.c.x > 10 && c.c.x < w - 10 && c.c.y > 10 && c.c.y < h - 10);
-
-  return { holes, thresholdUsed: thr };
-}
-
-/**
- * Bull-logic (direction) — explicit comparisons, no ambiguity.
- */
-function bullDialFromPoib(poibX, poibY) {
-  const eps = 1e-6;
-
-  // Windage: POIB right => dial LEFT, POIB left => dial RIGHT
-  let windDir = "CENTER";
-  if (poibX > eps) windDir = "LEFT";
-  else if (poibX < -eps) windDir = "RIGHT";
-
-  // Elevation: POIB up => dial DOWN, POIB down => dial UP
-  let elevDir = "CENTER";
-  if (poibY > eps) elevDir = "DOWN";
-  else if (poibY < -eps) elevDir = "UP";
-
-  return { windDir, elevDir };
-}
-
+// -----------------------------
+// Routes
+// -----------------------------
 app.get("/", (req, res) => {
-  res.status(200).send(JSON.stringify({ ok: true, service: "sczn3-sec-backend-pipe", status: "alive" }));
+  res.status(200).send(JSON.stringify({ ok: true, service: SERVICE_NAME, status: "alive", build: BUILD_TAG }));
 });
 
 app.post("/api/sec", upload.single("image"), async (req, res) => {
   try {
+    const distanceYards = n(req.body?.distanceYards ?? req.body?.distance ?? 100, 100);
+    const clickValueMoa = n(req.body?.clickValueMoa ?? req.body?.clickValue ?? 0.25, 0.25);
+
+    // Frontend may send "targetSizeInches" as 11 (meaning 8.5x11) OR "8.5x11"
+    const targetSpecRaw = req.body?.targetSizeSpec ?? req.body?.targetSizeInches ?? req.body?.targetSize ?? "11";
+    const spec = parseTargetSpec(targetSpecRaw);
+
+    if (!spec.ok) {
+      return res.status(400).send(
+        JSON.stringify({
+          ok: false,
+          service: SERVICE_NAME,
+          build: BUILD_TAG,
+          error: { code: "BAD_TARGET_SPEC", message: "Unsupported target size spec", detail: spec },
+        })
+      );
+    }
+
     if (!req.file || !req.file.buffer) {
       return res.status(400).send(
         JSON.stringify({
           ok: false,
-          computeStatus: "FAILED_INPUT",
-          error: { code: "NO_IMAGE", message: "Missing multipart field: image" },
+          service: SERVICE_NAME,
+          build: BUILD_TAG,
+          error: { code: "NO_IMAGE", message: "No file uploaded. Use multipart field name: image" },
         })
       );
     }
 
-    const distanceYards = num(req.body.distanceYards, 100);
-    const clickValueMoa = num(req.body.clickValueMoa, 0.25);
+    // Normalize image size for stable detection
+    const input = sharp(req.file.buffer).rotate();
 
-    // IMPORTANT: This must be LONG SIDE inches
-    // 8.5x11 => 11, 23x23 => 23
-    const targetSizeInches = num(req.body.targetSizeInches, 11);
+    const meta = await input.metadata();
+    const maxW = 1400;
+    const maxH = 1800;
 
-    // Read + normalize image
-    // (resize down for speed but keep geometry stable)
-    const img0 = sharp(req.file.buffer, { failOnError: false }).rotate();
-    const meta = await img0.metadata();
+    const resized = input.resize({
+      width: meta.width && meta.width > maxW ? maxW : undefined,
+      height: meta.height && meta.height > maxH ? maxH : undefined,
+      fit: "inside",
+      withoutEnlargement: true,
+    });
 
-    const maxSide = 1600;
-    let img = img0;
-    if (meta.width && meta.height) {
-      const longPx = Math.max(meta.width, meta.height);
-      if (longPx > maxSide) {
-        img = img0.resize({
-          width: meta.width >= meta.height ? maxSide : null,
-          height: meta.height > meta.width ? maxSide : null,
-          fit: "inside",
-        });
-      }
-    }
+    // Grayscale raw buffer
+    const { data, info } = await resized
+      .grayscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
 
-    const { data, info } = await img.clone().grayscale().raw().toBuffer({ resolveWithObject: true });
-    const w = info.width;
-    const h = info.height;
+    const imgW = info.width;
+    const imgH = info.height;
 
-    // Compute pixels-per-inch from LONG SIDE
-    const longSidePx = Math.max(w, h);
-    const pixelsPerInch = longSidePx / targetSizeInches;
-
-    // Step 1: find fiducials (corner black squares) to get bull center
-    // Build a dark mask for fiducials
-    const fidMask = new Uint8Array(w * h);
-    // Use a darker threshold for fiducials
-    let sum = 0;
-    const step = Math.max(1, Math.floor((w * h) / 50000));
-    for (let i = 0; i < data.length; i += step) sum += data[i];
-    const mean = sum / Math.ceil(data.length / step);
-    const fidThr = clamp(Math.round(mean - 70), 20, 160);
-
-    for (let i = 0; i < data.length; i++) {
-      if (data[i] < fidThr) fidMask[i] = 1;
-    }
-
-    const fidComps = findComponents(fidMask, w, h);
-    const centerInfo = estimateCenterFromFiducials(fidComps, w, h);
-
-    if (!centerInfo) {
-      return res.status(200).send(
-        JSON.stringify({
-          ok: false,
-          service: "sczn3-sec-backend-pipe",
-          computeStatus: "FAILED_FIDUCIALS",
-          error: {
-            code: "FIDUCIALS_NOT_FOUND",
-            message: "Could not locate 4 corner fiducials to compute bull center.",
-          },
-          detect: {
-            normalized: { width: w, height: h },
-            pixelsPerInch,
-            fiducialThresholdUsed: fidThr,
-            fiducialComponents: fidComps.length,
-          },
-          sec: { distanceYards, clickValueMoa, targetSizeInches },
-        })
-      );
-    }
-
-    const centerPx = centerInfo.centerPx;
-
-    // Exclude fiducial boxes so they don't count as holes
-    const excludeBoxes = Object.values(centerInfo.fiducials).map((c) => c.bbox);
-
-    // Step 2: detect holes (dark blobs) excluding fiducials
-    const holesResult = detectHolesFromImage(data, w, h, excludeBoxes);
-    const holes = holesResult.holes;
+    const holes = detectHolesFromGrayscale(data, imgW, imgH);
 
     if (!holes.length) {
       return res.status(200).send(
         JSON.stringify({
-          ok: false,
-          service: "sczn3-sec-backend-pipe",
+          ok: true,
+          service: SERVICE_NAME,
+          build: BUILD_TAG,
           computeStatus: "FAILED_HOLES",
-          error: {
-            code: "HOLES_NOT_FOUND",
-            message: "No bullet holes detected. Use a clean light-grid SCZN3 test target image.",
-          },
+          error: { code: "HOLES_NOT_FOUND", message: "No bullet holes detected. Use a clean photo on the grid bull target." },
           detect: {
-            normalized: { width: w, height: h },
-            centerPx,
-            pixelsPerInch,
-            fiducialThresholdUsed: fidThr,
-            holeThresholdUsed: holesResult.thresholdUsed,
+            normalized: { width: imgW, height: imgH },
             holesDetected: 0,
           },
-          sec: { distanceYards, clickValueMoa, targetSizeInches },
+          sec: { distanceYards, clickValueMoa, targetSizeSpec: targetSpecRaw, widthIn: spec.widthIn, heightIn: spec.heightIn },
         })
       );
     }
 
-    // Group center = tight cluster average of hole centroids
-    const points = holes.map((h0) => ({ x: h0.c.x, y: h0.c.y }));
-    const groupCenterPx = tightClusterAverage(points);
+    // Group center = average of hole centroids (in pixels)
+    let sx = 0, sy = 0;
+    for (const h of holes) {
+      sx += h.cx;
+      sy += h.cy;
+    }
+    const groupCenterPx = { x: sx / holes.length, y: sy / holes.length };
 
-    // POIB inches (cluster relative to bull center)
-    // X: Right +, Left -
-    // Y: Up +, Down -   (pixel Y grows DOWN, so flip once here)
-    const dxPx = groupCenterPx.x - centerPx.x;
-    const dyPx = groupCenterPx.y - centerPx.y;
+    // Map group center to inches (origin top-left, y down)
+    const groupIn = pxToIn(groupCenterPx.x, groupCenterPx.y, imgW, imgH, spec.widthIn, spec.heightIn);
 
-    const poibX = dxPx / pixelsPerInch;
-    const poibY = -(dyPx / pixelsPerInch); // flip once, LOCKED
+    // Bull is exact center of the target (in inches)
+    const bull = { x: spec.widthIn / 2, y: spec.heightIn / 2 };
 
-    // Bull logic for directions (explicit comparisons)
-    const { windDir, elevDir } = bullDialFromPoib(poibX, poibY);
-
-    // Click math (True MOA)
-    const inchesPerClick = inchesPerMoaAtYards(distanceYards) * clickValueMoa;
-
-    // Correction inches = "move impact to bull"
-    // Wind correction is opposite of POIB.x
-    const corrX = -poibX;
-    const corrY = -poibY;
-
-    // Signed clicks (for debugging/auditing)
-    const wSigned = corrX / inchesPerClick;
-    const eSigned = corrY / inchesPerClick;
-
-    const wMag = Math.abs(wSigned);
-    const eMag = Math.abs(eSigned);
-
-    const response = {
-      ok: true,
-      service: "sczn3-sec-backend-pipe",
-      build: "BULL_LOGIC_LOCKED_V1",
-      received: {
-        field: "image",
-        originalname: req.file.originalname || null,
-        mimetype: req.file.mimetype || null,
-        bytes: req.file.size || null,
-      },
-      sec: {
-        distanceYards,
-        clickValueMoa,
-        targetSizeInches,
-      },
-      computeStatus: "COMPUTED_FROM_IMAGE",
-      detect: {
-        normalized: { width: w, height: h },
-        centerPx: { x: round2(centerPx.x), y: round2(centerPx.y) },
-        groupCenterPx: { x: round2(groupCenterPx.x), y: round2(groupCenterPx.y), used: groupCenterPx.used },
-        pixelsPerInch: round2(pixelsPerInch),
-        fiducialThresholdUsed: fidThr,
-        holeThresholdUsed: holesResult.thresholdUsed,
-        holesDetected: holes.length,
-      },
-      poibInches: {
-        x: round2(poibX),
-        y: round2(poibY),
-      },
-      // Debug: signed clicks
-      clicksSigned: {
-        windage: round2(wSigned),
-        elevation: round2(eSigned),
-      },
-      // UI-friendly minimal output (direction from bull logic, magnitude from click math)
-      dial: {
-        windage: `${windDir} ${fmt2(wMag)} clicks`,
-        elevation: `${elevDir} ${fmt2(eMag)} clicks`,
-      },
-      minimal: {
-        windage: { direction: windDir, clicks: fmt2(wMag) },
-        elevation: { direction: elevDir, clicks: fmt2(eMag) },
-      },
+    // POIB inches (SCZN3 convention):
+    // X: Right + / Left -
+    // Y: Up + / Down -
+    //
+    // Image Y grows DOWN, so we flip ONCE here:
+    // poibY = bullY - groupY
+    const poib = {
+      x: groupIn.xIn - bull.x,
+      y: bull.y - groupIn.yIn,
     };
 
-    return res.status(200).send(JSON.stringify(response));
-  } catch (err) {
+    // Correction inches to move POIB to bull:
+    // correction = bull - POIB  (equivalent to -POIB in this coordinate system)
+    const corrIn = {
+      x: -poib.x,
+      y: -poib.y,
+    };
+
+    const inchesPerMoa = inchesPerMoaAtYards(distanceYards);
+    const inchesPerClick = inchesPerMoa * clickValueMoa;
+
+    if (!Number.isFinite(inchesPerClick) || inchesPerClick <= 0) {
+      return res.status(400).send(
+        JSON.stringify({
+          ok: false,
+          service: SERVICE_NAME,
+          build: BUILD_TAG,
+          error: { code: "BAD_SCOPE_PARAMS", message: "Bad distanceYards or clickValueMoa" },
+        })
+      );
+    }
+
+    // Signed correction clicks (what to dial)
+    const clicksSigned = {
+      windage: round2(corrIn.x / inchesPerClick),
+      elevation: round2(corrIn.y / inchesPerClick),
+    };
+
+    const dial = dialFromCorrection(clicksSigned.windage, clicksSigned.elevation);
+
     return res.status(200).send(
       JSON.stringify({
+        ok: true,
+        service: SERVICE_NAME,
+        build: BUILD_TAG,
+        received: {
+          originalName: req.file.originalname,
+          bytes: req.file.size,
+          mimetype: req.file.mimetype,
+        },
+        sec: {
+          distanceYards,
+          clickValueMoa,
+          targetSizeSpec: targetSpecRaw,
+          widthIn: spec.widthIn,
+          heightIn: spec.heightIn,
+        },
+        computeStatus: "COMPUTED_FROM_IMAGE",
+        detect: {
+          normalized: { width: imgW, height: imgH },
+          holesDetected: holes.length,
+          holes: holes.slice(0, 20), // cap
+          groupCenterPx,
+          groupCenterIn: { x: round2(groupIn.xIn), y: round2(groupIn.yIn) },
+          bullIn: { x: round2(bull.x), y: round2(bull.y) },
+        },
+        poibInches: { x: round2(poib.x), y: round2(poib.y) },
+        correctionInches: { x: round2(corrIn.x), y: round2(corrIn.y) },
+        clicksSigned,
+        dial,
+      })
+    );
+  } catch (e) {
+    return res.status(500).send(
+      JSON.stringify({
         ok: false,
-        service: "sczn3-sec-backend-pipe",
-        computeStatus: "FAILED_EXCEPTION",
-        error: { code: "EXCEPTION", message: String(err && err.message ? err.message : err) },
+        service: SERVICE_NAME,
+        build: BUILD_TAG,
+        error: { code: "SERVER_ERROR", message: String(e?.message || e) },
       })
     );
   }
 });
 
+// Render port
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   // eslint-disable-next-line no-console
-  console.log(`sczn3-sec-backend-pipe listening on ${PORT}`);
+  console.log(`[${SERVICE_NAME}] listening on :${PORT} build=${BUILD_TAG}`);
 });
