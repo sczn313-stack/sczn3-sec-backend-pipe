@@ -1,336 +1,280 @@
-// server.js
-// SCZN3 SEC backend - hardened gateway for UI congruence + safe runtime
-// Build marker: BULL_LOCKED_V4
-
 'use strict';
 
+/*
+  SCZN3 SEC backend (gateway + engine auto-loader)
+  Build marker: BULL_LOCKED_V5
+
+  Fixes:
+  - Stops ENGINE_NOT_FOUND by auto-locating the SEC engine module in common repo paths
+  - Accepts targetSizeSpec OR targetSizeInches OR widthIn/heightIn
+  - If UI only sends targetSizeInches=11, defaults to 8.5x11 (common paper) so UI+backend agree
+*/
+
+const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 
-const app = express();
+const BUILD = 'BULL_LOCKED_V5';
+const SERVICE = 'sczn3-sec-backend-pipe';
 
+const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-// Multer (multipart) for image upload
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+  limits: { fileSize: 25 * 1024 * 1024 },
 });
 
 // ---------- helpers ----------
+
 function isFiniteNumber(n) {
   return typeof n === 'number' && Number.isFinite(n);
 }
 
-function toNumber(v) {
+function toNum(v) {
   if (v === null || v === undefined) return NaN;
   if (typeof v === 'number') return v;
-  if (typeof v === 'string') {
-    const t = v.trim();
-    if (!t) return NaN;
-    const n = Number(t);
-    return Number.isFinite(n) ? n : NaN;
-  }
-  return NaN;
+  if (typeof v !== 'string') return NaN;
+  const t = v.trim();
+  if (!t) return NaN;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : NaN;
 }
 
-// Accepts "8.5x11", "8.5×11", "8.5 X 11", etc.
-function parseSizeSpec(spec) {
-  if (!spec || typeof spec !== 'string') return null;
-  const s = spec
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function normalizeSizeSpec(specRaw) {
+  if (!specRaw) return '';
+  return String(specRaw)
+    .trim()
     .toLowerCase()
     .replace('×', 'x')
-    .replace(/\s+/g, '')
-    .replace(/"/g, '');
-
-  const m = s.match(/^(\d+(\.\d+)?)x(\d+(\.\d+)?)$/);
-  if (!m) return null;
-
-  const a = Number(m[1]);
-  const b = Number(m[3]);
-  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return null;
-
-  const widthIn = a;
-  const heightIn = b;
-  const longIn = Math.max(a, b);
-  const shortIn = Math.min(a, b);
-
-  return { widthIn, heightIn, longIn, shortIn, targetSizeSpec: `${widthIn}x${heightIn}` };
+    .replace(/\s+/g, '');
 }
 
-function pickTargetSize(body) {
-  // UI may send:
-  // - targetSizeSpec: "8.5x11" (preferred)
-  // - targetSizeInches: 8.5 (numeric) OR "8.5x11" (string)
-  // - widthIn / heightIn
-  // - targetSize: "8.5x11"
-  const rawSpec =
-    body.targetSizeSpec ??
-    body.targetSize ??
-    body.targetSpec ??
-    body.sizeSpec ??
-    null;
+function parseSizeSpec(specRaw) {
+  const spec = normalizeSizeSpec(specRaw);
+  if (!spec) return null;
 
-  // If targetSizeInches is a string like "8.5x11", treat it as a spec too
-  const tsi = body.targetSizeInches;
-  const tsiAsSpec = (typeof tsi === 'string' && /x|×/i.test(tsi)) ? tsi : null;
-
-  const specObj = parseSizeSpec(String(rawSpec || tsiAsSpec || ''));
-
-  const w = toNumber(body.widthIn);
-  const h = toNumber(body.heightIn);
-
-  // If spec exists, use it
-  if (specObj) return specObj;
-
-  // Else if width/height numeric exist, use them
-  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
-    const longIn = Math.max(w, h);
-    const shortIn = Math.min(w, h);
-    return { widthIn: w, heightIn: h, longIn, shortIn, targetSizeSpec: `${w}x${h}` };
+  // allow "8.5x11" or "11x8.5"
+  const m = spec.match(/^(\d+(\.\d+)?)x(\d+(\.\d+)?)$/);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[3]);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+    const long = Math.max(a, b);
+    const short = Math.min(a, b);
+    return { spec: `${short}x${long}`, widthIn: short, heightIn: long, long, short, source: 'spec' };
   }
 
-  // Else if targetSizeInches is numeric, we can at least echo it back
-  const tsiNum = toNumber(tsi);
-  if (Number.isFinite(tsiNum) && tsiNum > 0) {
-    // We don't know the other dimension, but we can keep UI congruent.
-    return { widthIn: tsiNum, heightIn: tsiNum, longIn: tsiNum, shortIn: tsiNum, targetSizeSpec: `${tsiNum}x${tsiNum}` };
+  // allow a single number like "11" (UI sometimes sends this)
+  const n = Number(spec);
+  if (Number.isFinite(n)) {
+    // default common paper inference
+    if (Math.abs(n - 11) < 0.0001) {
+      return { spec: '8.5x11', widthIn: 8.5, heightIn: 11, long: 11, short: 8.5, source: 'inferred_11_is_letter' };
+    }
+    // square fallback
+    return { spec: `${n}x${n}`, widthIn: n, heightIn: n, long: n, short: n, source: 'single_number_square' };
   }
 
   return null;
 }
 
-function normalizeSec(body) {
-  const distanceYards = toNumber(body.distanceYards ?? body.distance ?? body.yards);
-  const clickValueMoa = toNumber(body.clickValueMoa ?? body.clickValue ?? body.moaPerClick ?? body.click);
-
-  const size = pickTargetSize(body);
-
-  // IMPORTANT: UI congruence gate wants:
-  // - sec.targetSizeSpec (string)
-  // - sec.targetSizeInches (numeric)
-  // We'll echo:
-  // - widthIn/heightIn
-  // - targetSizeInches as LONG side (numeric)
-  // - targetSizeSpec as "WxH"
-  const sec = {
-    distanceYards: Number.isFinite(distanceYards) ? distanceYards : 100,
-    clickValueMoa: Number.isFinite(clickValueMoa) ? clickValueMoa : 0.25,
-  };
-
-  if (size) {
-    sec.targetSizeSpec = size.targetSizeSpec;
-    sec.widthIn = size.widthIn;
-    sec.heightIn = size.heightIn;
-    sec.targetSizeInches = size.longIn; // numeric, avoids NaN and satisfies UI gate
-  }
-
-  return sec;
-}
-
-// Attempts to load an existing engine from common filenames without breaking deploy
-function tryLoadEngine() {
+function resolveEngine() {
+  // Try common locations without assuming exact repo structure
   const candidates = [
+    './secEngine.js',
     './secEngine',
-    './sec',
-    './computeSec',
+    './engine/secEngine.js',
+    './engine/secEngine',
+    './src/secEngine.js',
     './src/secEngine',
-    './src/sec',
-    './src/computeSec',
-    './lib/secEngine',
-    './lib/sec',
+    './src/engine/secEngine.js',
+    './src/engine/secEngine',
+    './backend/src/secEngine.js',
+    './backend/src/secEngine',
+    './backend/src/engine/secEngine.js',
+    './backend/src/engine/secEngine',
   ];
 
-  for (const p of candidates) {
-    try {
-      // eslint-disable-next-line import/no-dynamic-require, global-require
-      const mod = require(p);
-      if (!mod) continue;
+  for (const rel of candidates) {
+    const abs = path.resolve(__dirname, rel);
+    const jsAbs = abs.endsWith('.js') ? abs : `${abs}.js`;
 
-      // function export
-      if (typeof mod === 'function') return { kind: 'fn', fn: mod };
+    if (fs.existsSync(abs) || fs.existsSync(jsAbs)) {
+      try {
+        // require prefers exact file; try both
+        let mod = null;
+        try { mod = require(abs); } catch (_) { mod = require(jsAbs); }
 
-      // named exports
-      if (typeof mod.computeSEC === 'function') return { kind: 'fn', fn: mod.computeSEC };
-      if (typeof mod.computeSec === 'function') return { kind: 'fn', fn: mod.computeSec };
-      if (typeof mod.run === 'function') return { kind: 'fn', fn: mod.run };
-      if (typeof mod.handle === 'function') return { kind: 'fn', fn: mod.handle };
-
-      // object export fallback
-      return { kind: 'obj', obj: mod };
-    } catch (e) {
-      // ignore and keep trying
+        // support multiple export styles
+        if (typeof mod === 'function') return { fn: mod, from: rel };
+        if (mod && typeof mod.computeSEC === 'function') return { fn: mod.computeSEC, from: rel };
+        if (mod && typeof mod.compute === 'function') return { fn: mod.compute, from: rel };
+        if (mod && typeof mod.default === 'function') return { fn: mod.default, from: rel };
+      } catch (e) {
+        // keep searching
+      }
     }
   }
+
   return null;
 }
 
-const ENGINE = tryLoadEngine();
-
-// Converts dial text like "RIGHT 0.96 clicks" into signed numbers
-function parseDialLine(line) {
-  if (!line || typeof line !== 'string') return null;
-  const s = line.trim().toUpperCase();
-  const m = s.match(/(LEFT|RIGHT|UP|DOWN)\s+(-?\d+(\.\d+)?)/);
-  if (!m) return null;
-  const dir = m[1];
-  const mag = Number(m[2]);
-  if (!Number.isFinite(mag)) return null;
-  return { dir, mag };
-}
-
-function ensureClicksSigned(out) {
-  // If already present & valid, keep it
-  if (
-    out &&
-    out.clicksSigned &&
-    isFiniteNumber(out.clicksSigned.windage) &&
-    isFiniteNumber(out.clicksSigned.elevation)
-  ) {
-    return out;
-  }
-
-  // Try to derive from "dial" lines if present
-  const dial = out && (out.dial || out.dialLines || out.lines || out.minimal);
-  if (Array.isArray(dial)) {
-    let w = null;
-    let e = null;
-
-    for (const ln of dial) {
-      const parsed = parseDialLine(ln);
-      if (!parsed) continue;
-      if (parsed.dir === 'RIGHT') w = +Math.abs(parsed.mag);
-      if (parsed.dir === 'LEFT') w = -Math.abs(parsed.mag);
-      if (parsed.dir === 'UP') e = +Math.abs(parsed.mag);
-      if (parsed.dir === 'DOWN') e = -Math.abs(parsed.mag);
-    }
-
-    if (Number.isFinite(w) && Number.isFinite(e)) {
-      out.clicksSigned = { windage: w, elevation: e };
-      return out;
-    }
-  }
-
-  // Last resort: keep UI stable (explicitly mark missing)
-  out.clicksSigned = { windage: 0, elevation: 0 };
-  out._clicksSignedNote = 'Derived fallback (engine did not provide clicksSigned).';
-  return out;
-}
+const engineResolved = resolveEngine();
 
 // ---------- routes ----------
-app.get('/', (_req, res) => {
+
+app.get('/', (req, res) => {
   res.json({
     ok: true,
-    service: 'sczn3-sec-backend-pipe',
+    service: SERVICE,
     status: 'alive',
-    build: 'BULL_LOCKED_V4',
+    build: BUILD,
+    engine: engineResolved ? { found: true, from: engineResolved.from } : { found: false },
   });
 });
 
-// So visiting /api/sec in browser does NOT say "Cannot GET /api/sec"
-app.get('/api/sec', (_req, res) => {
+// convenient sanity check (so /api/sec doesn't show "Cannot GET")
+app.get('/api/sec', (req, res) => {
   res.json({
     ok: true,
-    service: 'sczn3-sec-backend-pipe',
+    service: SERVICE,
     status: 'alive',
-    build: 'BULL_LOCKED_V4',
-    hint: 'POST multipart to /api/sec with field: image',
+    build: BUILD,
+    note: 'POST multipart to this endpoint with field "image" plus distanceYards, clickValueMoa, and a target size field.',
+    expects: {
+      imageField: 'image',
+      sizeFieldsAccepted: ['targetSizeSpec', 'targetSizeInches', 'widthIn', 'heightIn'],
+    },
+    engine: engineResolved ? { found: true, from: engineResolved.from } : { found: false },
   });
 });
 
 app.post('/api/sec', upload.single('image'), async (req, res) => {
   try {
-    const sec = normalizeSec(req.body || {});
+    const distanceYards = toNum(req.body.distanceYards);
+    const clickValueMoa = toNum(req.body.clickValueMoa);
 
-    // Require target size spec OR we can’t map inches properly
-    if (!sec.targetSizeSpec || !isFiniteNumber(sec.targetSizeInches)) {
-      return res.status(400).json({
-        ok: false,
-        service: 'sczn3-sec-backend-pipe',
-        build: 'BULL_LOCKED_V4',
-        error: {
-          code: 'BAD_TARGET_SPEC',
-          message: 'targetSizeSpec required (ex: 8.5x11). UI can also send targetSizeInches="8.5x11".',
-        },
-        sec,
-      });
+    // Accept any size inputs the UI might send
+    const bodyTargetSizeSpec = req.body.targetSizeSpec;
+    const bodyTargetSizeInches = req.body.targetSizeInches;
+
+    const widthInRaw = toNum(req.body.widthIn);
+    const heightInRaw = toNum(req.body.heightIn);
+
+    let size = null;
+
+    // 1) width/height provided
+    if (Number.isFinite(widthInRaw) && Number.isFinite(heightInRaw)) {
+      const long = Math.max(widthInRaw, heightInRaw);
+      const short = Math.min(widthInRaw, heightInRaw);
+      size = { spec: `${short}x${long}`, widthIn: short, heightIn: long, long, short, source: 'width_height' };
     }
 
-    if (!req.file || !req.file.buffer) {
-      return res.status(400).json({
-        ok: false,
-        service: 'sczn3-sec-backend-pipe',
-        build: 'BULL_LOCKED_V4',
-        error: { code: 'NO_IMAGE', message: 'No image uploaded. Field name must be "image".' },
-        sec,
-      });
+    // 2) explicit spec provided
+    if (!size && bodyTargetSizeSpec) {
+      size = parseSizeSpec(bodyTargetSizeSpec);
     }
 
-    // If your repo has a compute engine, use it. If not, don’t crash the deploy.
-    let out = null;
+    // 3) targetSizeInches provided (might be "8.5x11" or "11")
+    if (!size && bodyTargetSizeInches !== undefined) {
+      size = parseSizeSpec(bodyTargetSizeInches);
+    }
 
-    if (ENGINE && ENGINE.kind === 'fn') {
-      // We try a few call signatures safely.
-      const fn = ENGINE.fn;
+    // last-resort default (letter)
+    if (!size) {
+      size = { spec: '8.5x11', widthIn: 8.5, heightIn: 11, long: 11, short: 8.5, source: 'default_letter' };
+    }
 
-      // Prefer passing a single object
-      try {
-        out = await Promise.resolve(fn({ image: req.file.buffer, sec, req }));
-      } catch (_e1) {
-        // Try positional args (buffer, sec)
-        out = await Promise.resolve(fn(req.file.buffer, sec));
-      }
-    } else {
-      // No engine found — respond without breaking UI and without crashing Render
-      out = {
+    // Build SEC echo object (UI needs these echoed back)
+    const sec = {
+      distanceYards: Number.isFinite(distanceYards) ? distanceYards : 100,
+      clickValueMoa: Number.isFinite(clickValueMoa) ? clickValueMoa : 0.25,
+      targetSizeSpec: size.spec,
+      widthIn: size.widthIn,
+      heightIn: size.heightIn,
+      targetSizeInches: size.long,
+      _sizeSource: size.source,
+    };
+
+    // If engine exists, run it. Otherwise return explicit ENGINE_MISSING.
+    if (!engineResolved) {
+      return res.json({
         ok: true,
         computeStatus: 'ENGINE_MISSING',
-        error: { code: 'ENGINE_NOT_FOUND', message: 'No SEC engine module found in repo. Gateway is alive.' },
+        error: {
+          code: 'ENGINE_NOT_FOUND',
+          message: 'No SEC engine module found in repo. Gateway is alive.',
+        },
         detect: { normalized: null, holesDetected: 0, holes: [] },
-      };
+        service: SERVICE,
+        build: BUILD,
+        received: {
+          originalName: req.file ? req.file.originalname : null,
+          bytes: req.file ? req.file.size : 0,
+          mimetype: req.file ? req.file.mimetype : null,
+        },
+        sec,
+        clicksSigned: { windage: 0, elevation: 0 },
+        _clicksSignedNote: 'Derived fallback (engine missing).',
+      });
     }
 
-    // Make sure we never reference an undefined "holes"
-    // If your engine returns detect.holes, normalize it here.
-    const detect = out && out.detect ? out.detect : {};
-    const holesArr = Array.isArray(detect.holes) ? detect.holes : [];
-    detect.holes = holesArr;
-    detect.holesDetected = Number.isFinite(detect.holesDetected) ? detect.holesDetected : holesArr.length;
-    out.detect = detect;
+    const imageBuffer = req.file ? req.file.buffer : null;
 
-    // Guarantee congruence echo fields
-    out.ok = out.ok !== false; // default true unless engine set false
-    out.service = 'sczn3-sec-backend-pipe';
-    out.build = 'BULL_LOCKED_V4';
-    out.received = {
-      originalName: req.file.originalname,
-      bytes: req.file.size,
-      mimetype: req.file.mimetype,
-    };
-    out.sec = sec;
+    // Call the engine in a tolerant way: engine can return an object we merge
+    const engineOut = await Promise.resolve(
+      engineResolved.fn({
+        imageBuffer,
+        sec,
+        meta: {
+          originalName: req.file ? req.file.originalname : null,
+          bytes: req.file ? req.file.size : 0,
+          mimetype: req.file ? req.file.mimetype : null,
+        },
+      })
+    );
 
-    // Ensure clicksSigned exists (UI gate)
-    out = ensureClicksSigned(out);
+    // Ensure the response always includes required fields for the UI
+    const out = Object.assign(
+      {
+        ok: true,
+        service: SERVICE,
+        build: BUILD,
+        sec,
+      },
+      engineOut || {}
+    );
+
+    // If engine didn't include clicksSigned, do not fake it
+    if (!out.clicksSigned) {
+      out.clicksSigned = null;
+      out._clicksSignedNote = 'Engine did not return clicksSigned.';
+    }
 
     return res.json(out);
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      service: 'sczn3-sec-backend-pipe',
-      build: 'BULL_LOCKED_V4',
+      service: SERVICE,
+      build: BUILD,
       error: {
         code: 'SERVER_ERROR',
-        message: err && err.message ? err.message : 'Unknown server error',
+        message: String(err && err.message ? err.message : err),
       },
     });
   }
 });
 
-// Render port
-const PORT = process.env.PORT || 3000;
+// ---------- start ----------
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  // Keep logs minimal
-  console.log(`SEC backend listening on ${PORT} (BULL_LOCKED_V4)`);
+  console.log(`[${SERVICE}] listening on ${PORT} build=${BUILD} engine=${engineResolved ? engineResolved.from : 'none'}`);
 });
