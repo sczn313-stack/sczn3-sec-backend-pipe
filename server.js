@@ -1,268 +1,299 @@
-"use strict";
+'use strict';
 
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
+/**
+ * SCZN3 SEC Backend (POIB Anchor)
+ * Build: POIB_ANCHOR_V2
+ *
+ * Inputs supported:
+ *  - POST /api/sec (multipart or JSON)
+ *    Required: holes (array) OR holesJson (stringified array)
+ *    Optional: image (file) [ignored if holes provided]
+ *    Optional: distanceYards (number, default 100)
+ *    Optional: clickValueMoa (number, default 0.25)
+ *    Optional: targetSizeSpec (string like "8.5x11")
+ *    Optional: targetSizeInches (number)  (legacy)
+ *    Optional: widthIn, heightIn (numbers)
+ *    Optional: bullXIn, bullYIn (numbers) (defaults to center of target)
+ *    Optional: deadbandIn (number, default 0)
+ *    Optional: minShots (number, default 3)
+ *
+ * Output:
+ *  - clicksSigned.windage (positive = RIGHT, negative = LEFT)
+ *  - clicksSigned.elevation (positive = UP, negative = DOWN)
+ */
+
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+
+const BUILD = 'POIB_ANCHOR_V2';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: '2mb' }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
 });
 
-// -------------------- Helpers --------------------
 function round2(n) {
-  return Math.round(n * 100) / 100;
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round(x * 100) / 100;
 }
 
-function parseTargetSizeSpec(specRaw) {
-  // Accepts: "8.5x11", "8.5×11", "8.5 X 11"
-  const s = String(specRaw || "")
-    .trim()
-    .toLowerCase()
-    .replace("×", "x")
-    .replace(/\s+/g, "");
+function toNumber(v, fallback) {
+  if (v === null || v === undefined || v === '') return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
 
-  const m = s.match(/^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)$/);
+function parseSizeSpec(spec) {
+  // Accept: "8.5x11", "8.5×11", "8.5 x 11", "11x8.5"
+  if (!spec || typeof spec !== 'string') return null;
+
+  const s = spec
+    .toLowerCase()
+    .replace('×', 'x')
+    .replace(/\s+/g, '')
+    .trim();
+
+  const m = s.match(/^(\d+(\.\d+)?)(x)(\d+(\.\d+)?)$/);
   if (!m) return null;
 
-  const w = Number(m[1]);
-  const h = Number(m[2]);
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  const a = Number(m[1]);
+  const b = Number(m[4]);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return null;
 
-  return { spec: `${w}x${h}`, widthIn: w, heightIn: h };
+  // IMPORTANT: preserve the user's order.
+  // "8.5x11" => width=8.5, height=11
+  // "11x8.5" => width=11, height=8.5
+  return {
+    spec: `${a}x${b}`,
+    widthIn: a,
+    heightIn: b,
+    longIn: Math.max(a, b),
+    shortIn: Math.min(a, b),
+  };
 }
 
-// True MOA: 1 MOA = 1.047" @ 100y
-function inchesPerClick(distanceYards, clickValueMoa) {
-  const d = Number(distanceYards);
-  const c = Number(clickValueMoa);
-  if (!Number.isFinite(d) || d <= 0) return NaN;
-  if (!Number.isFinite(c) || c <= 0) return NaN;
-  const inchesPerMoa = 1.047 * (d / 100);
-  return inchesPerMoa * c; // inches per click
-}
+function normalizeHoles(input) {
+  // input may be: array, JSON string, or undefined
+  let holes = input;
 
-function computePOIBFromHolesInches({ holesIn, bullX, bullY, deadbandIn, minShots }) {
-  const bx = Number(bullX);
-  const by = Number(bullY);
-
-  if (!Number.isFinite(bx) || !Number.isFinite(by)) {
-    return { ok: false, code: "NO_BULL", message: "Missing/invalid bullX or bullY." };
+  if (typeof holes === 'string') {
+    try {
+      holes = JSON.parse(holes);
+    } catch {
+      // if the user pasted invalid JSON, treat as empty
+      holes = [];
+    }
   }
 
-  let used = 0;
-  let ignored = 0;
+  if (!Array.isArray(holes)) holes = [];
+
+  const clean = [];
+  for (const h of holes) {
+    if (!h || typeof h !== 'object') continue;
+    const x = Number(h.x);
+    const y = Number(h.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    clean.push({ x, y });
+  }
+  return clean;
+}
+
+function computePOIB(holes) {
   let sx = 0;
   let sy = 0;
-
-  for (const h of holesIn || []) {
-    const x = Number(h?.x);
-    const y = Number(h?.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-
-    const dx = x - bx;
-    const dy = y - by;
-
-    // Deadband tolerance: ignore near either axis line
-    if (Math.abs(dx) <= deadbandIn || Math.abs(dy) <= deadbandIn) {
-      ignored += 1;
-      continue;
-    }
-
-    sx += x;
-    sy += y;
-    used += 1;
+  for (const h of holes) {
+    sx += h.x;
+    sy += h.y;
   }
+  return { x: sx / holes.length, y: sy / holes.length };
+}
 
-  if (used < minShots) {
-    return {
-      ok: false,
-      code: "NOT_ENOUGH_USABLE_SHOTS",
-      message: `Need at least ${minShots} usable holes after deadband filter.`,
-      usedCount: used,
-      ignoredCount: ignored,
-    };
-  }
+function quadrantOfPoint(point, bull) {
+  const left = point.x < bull.x;
+  const above = point.y < bull.y; // smaller y = higher on page
+  if (left && above) return 'UL';
+  if (!left && above) return 'UR';
+  if (left && !above) return 'LL';
+  return 'LR';
+}
 
-  return {
+function dirLR(v) {
+  return v >= 0 ? 'RIGHT' : 'LEFT';
+}
+function dirUD(v) {
+  return v >= 0 ? 'UP' : 'DOWN';
+}
+
+function moaAtDistanceInches(distanceYards) {
+  // True MOA: 1.047 inches at 100 yards
+  return 1.047 * (distanceYards / 100);
+}
+
+app.get('/', (req, res) => {
+  return res.json({
     ok: true,
-    poib: { x: sx / used, y: sy / used },
-    usedCount: used,
-    ignoredCount: ignored,
-  };
-}
-
-// Coordinate assumption used here:
-// x increases RIGHT
-// y increases DOWN
-//
-// Direction rule (move POIB to bull):
-// - POIB left  => RIGHT
-// - POIB right => LEFT
-// - POIB above => DOWN
-// - POIB below => UP
-//
-// Signed convention returned:
-//  windage  >0 RIGHT, <0 LEFT
-//  elevation >0 UP,   <0 DOWN
-function computeClicksSignedFromPOIB({ poibX, poibY, bullX, bullY, distanceYards, clickValueMoa }) {
-  const ipc = inchesPerClick(distanceYards, clickValueMoa);
-  if (!Number.isFinite(ipc) || ipc <= 0) return null;
-
-  // bull - POIB: + => RIGHT, - => LEFT
-  const windSigned = (bullX - poibX) / ipc;
-
-  // y-down: POIB below bull => poibY > bullY => UP => positive
-  const elevSigned = (poibY - bullY) / ipc;
-
-  return {
-    windage: round2(windSigned),
-    elevation: round2(elevSigned),
-  };
-}
-
-function labelsFromSigned(w, e) {
-  return {
-    windageDir: w >= 0 ? "RIGHT" : "LEFT",
-    windageAbs: round2(Math.abs(w)),
-    elevationDir: e >= 0 ? "UP" : "DOWN",
-    elevationAbs: round2(Math.abs(e)),
-  };
-}
-
-function quadrantOfPOIB(poibX, poibY, bullX, bullY) {
-  const dx = poibX - bullX; // +RIGHT
-  const dy = poibY - bullY; // +DOWN
-  if (dx < 0 && dy < 0) return "UL";
-  if (dx > 0 && dy < 0) return "UR";
-  if (dx < 0 && dy > 0) return "LL";
-  return "LR";
-}
-
-// -------------------- Routes --------------------
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "sczn3-sec-backend-pipe",
-    build: "POIB_ANCHOR_V1",
-    status: "alive",
+    service: 'sczn3-sec-backend-pipe',
+    build: BUILD,
+    status: 'alive',
   });
 });
 
-app.post("/api/sec", upload.single("image"), async (req, res) => {
+app.post('/api/sec', upload.single('image'), (req, res) => {
   try {
-    const distanceYards = Number(req.body.distanceYards ?? 100);
-    const clickValueMoa = Number(req.body.clickValueMoa ?? 0.25);
+    const body = req.body || {};
 
-    const targetSizeSpec = String(req.body.targetSizeSpec ?? "8.5x11");
-    const size = parseTargetSizeSpec(targetSizeSpec);
+    const distanceYards = toNumber(body.distanceYards, 100);
+    const clickValueMoa = toNumber(body.clickValueMoa, 0.25);
+    const minShots = Math.max(1, Math.floor(toNumber(body.minShots, 3)));
+    const deadbandIn = Math.max(0, toNumber(body.deadbandIn, 0));
 
-    const bullX = Number(req.body.bullX);
-    const bullY = Number(req.body.bullY);
+    // Target size (multiple ways)
+    const sizeFromSpec = parseSizeSpec(body.targetSizeSpec || body.targetSize || body.targetSizeLabel);
+    const widthFromFields = toNumber(body.widthIn, NaN);
+    const heightFromFields = toNumber(body.heightIn, NaN);
 
-    const deadbandIn = Number(req.body.deadbandIn ?? 0.10);
-    const minShots = Number(req.body.minShots ?? 3);
+    let widthIn = Number.isFinite(widthFromFields) ? widthFromFields : (sizeFromSpec ? sizeFromSpec.widthIn : NaN);
+    let heightIn = Number.isFinite(heightFromFields) ? heightFromFields : (sizeFromSpec ? sizeFromSpec.heightIn : NaN);
 
-    // Input holes (in inches)
-    let holesIn = [];
-    if (req.body.holesJson) {
-      try {
-        const parsed = JSON.parse(req.body.holesJson);
-        if (Array.isArray(parsed)) holesIn = parsed;
-      } catch (_) {}
+    // Legacy: if they only send targetSizeInches=11 for 8.5x11, accept it as height and infer width=8.5
+    const legacyTargetSizeInches = toNumber(body.targetSizeInches, NaN);
+    if ((!Number.isFinite(widthIn) || !Number.isFinite(heightIn)) && Number.isFinite(legacyTargetSizeInches)) {
+      // If they only sent one number, assume it is the LONG side.
+      // For 8.5x11, long=11 short=8.5
+      const longIn = legacyTargetSizeInches;
+      const shortIn = round2(longIn === 11 ? 8.5 : (longIn === 17 ? 11 : 0)); // only safe guesses; otherwise leave 0
+      if (shortIn > 0) {
+        widthIn = shortIn;
+        heightIn = longIn;
+      }
     }
 
-    if (!holesIn.length) {
+    // If still unknown, default to 8.5x11
+    if (!Number.isFinite(widthIn) || !Number.isFinite(heightIn) || widthIn <= 0 || heightIn <= 0) {
+      widthIn = 8.5;
+      heightIn = 11;
+    }
+
+    const targetSizeSpecEcho = sizeFromSpec ? sizeFromSpec.spec : `${widthIn}x${heightIn}`;
+
+    // Bull point (defaults to center, but allow override)
+    const bullXIn = toNumber(body.bullXIn, widthIn / 2);
+    const bullYIn = toNumber(body.bullYIn, heightIn / 2);
+    const bull = { x: bullXIn, y: bullYIn };
+
+    // Holes input
+    const holes = normalizeHoles(body.holes || body.holesJson);
+    if (holes.length < minShots) {
       return res.status(400).json({
         ok: false,
-        build: "POIB_ANCHOR_V1",
+        service: 'sczn3-sec-backend-pipe',
+        build: BUILD,
         error: {
-          code: "NO_HOLES_INPUT",
-          message:
-            "No holesJson provided. This build expects holesJson (in inches) unless you wire a detector.",
+          code: 'NOT_ENOUGH_SHOTS',
+          message: `Need at least ${minShots} holes to compute POIB.`,
         },
-        required: {
-          holesJson: '[{"x":4.10,"y":6.80},{"x":4.20,"y":6.75},{"x":4.05,"y":6.90}]',
-          bullX: "inches",
-          bullY: "inches",
-        },
-      });
-    }
-
-    const poibRes = computePOIBFromHolesInches({
-      holesIn,
-      bullX,
-      bullY,
-      deadbandIn: Number.isFinite(deadbandIn) ? deadbandIn : 0.10,
-      minShots: Number.isFinite(minShots) ? minShots : 3,
-    });
-
-    if (!poibRes.ok) {
-      return res.json({
-        ok: false,
-        build: "POIB_ANCHOR_V1",
-        error: { code: poibRes.code, message: poibRes.message },
-        debug: {
-          usedCount: poibRes.usedCount ?? 0,
-          ignoredCount: poibRes.ignoredCount ?? 0,
-          deadbandIn,
+        received: {
+          holesCount: holes.length,
           minShots,
+          targetSizeSpec: targetSizeSpecEcho,
         },
       });
     }
 
-    const poibX = poibRes.poib.x;
-    const poibY = poibRes.poib.y;
+    // POIB anchor
+    const poib = computePOIB(holes);
 
-    const clicksSigned = computeClicksSignedFromPOIB({
-      poibX,
-      poibY,
-      bullX,
-      bullY,
-      distanceYards,
-      clickValueMoa,
-    });
+    // Deadband (inches)
+    const dxIn = bull.x - poib.x;     // + means POIB is left -> move RIGHT
+    const dyIn = bull.y - poib.y;     // + means POIB is above -> move DOWN (page coords)
+    const dxDb = Math.abs(dxIn) < deadbandIn ? 0 : dxIn;
+    const dyDb = Math.abs(dyIn) < deadbandIn ? 0 : dyIn;
 
-    if (!clicksSigned) {
-      return res.json({
+    // Convert inches -> clicks (true MOA)
+    const inchesPerClick = moaAtDistanceInches(distanceYards) * clickValueMoa;
+    if (!Number.isFinite(inchesPerClick) || inchesPerClick <= 0) {
+      return res.status(400).json({
         ok: false,
-        build: "POIB_ANCHOR_V1",
-        error: { code: "BAD_SCALE", message: "Bad distanceYards or clickValueMoa." },
+        service: 'sczn3-sec-backend-pipe',
+        build: BUILD,
+        error: {
+          code: 'BAD_CLICK_VALUE',
+          message: 'clickValueMoa and distanceYards must produce a valid inches-per-click value.',
+        },
       });
     }
 
-    const labels = labelsFromSigned(clicksSigned.windage, clicksSigned.elevation);
+    // LOCKED SIGN RULE:
+    // windage signed: + = RIGHT
+    // elevation signed: + = UP
+    const wClicks = round2(dxDb / inchesPerClick);
+
+    // For elevation: POIB below bull means poib.y > bull.y, and we want UP (positive)
+    // Therefore: elevationSigned = (poib.y - bull.y) / inchesPerClick
+    const eClicks = round2((poib.y - bull.y) / inchesPerClick);
+
+    const clicksSigned = { windage: wClicks, elevation: eClicks };
+
+    const scopeClicks = {
+      windage: `${dirLR(wClicks)} ${Math.abs(wClicks).toFixed(2)} clicks`,
+      elevation: `${dirUD(eClicks)} ${Math.abs(eClicks).toFixed(2)} clicks`,
+    };
 
     return res.json({
       ok: true,
-      build: "POIB_ANCHOR_V1",
+      service: 'sczn3-sec-backend-pipe',
+      build: BUILD,
       clicksSigned,
-      scopeClicks: {
-        windage: `${labels.windageDir} ${labels.windageAbs.toFixed(2)} clicks`,
-        elevation: `${labels.elevationDir} ${labels.elevationAbs.toFixed(2)} clicks`,
-      },
+      scopeClicks,
       debug: {
-        poib: { x: round2(poibX), y: round2(poibY) },
-        poibQuad: quadrantOfPOIB(poibX, poibY, bullX, bullY),
-        usedCount: poibRes.usedCount,
-        ignoredCount: poibRes.ignoredCount,
-        deadbandIn,
+        poib: { x: round2(poib.x), y: round2(poib.y) },
+        poibQuad: quadrantOfPoint(poib, bull),
+        bull: { x: round2(bull.x), y: round2(bull.y) },
+        usedCount: holes.length,
+        ignoredCount: 0,
+        deadbandIn: round2(deadbandIn),
         minShots,
-        targetSizeSpec: size?.spec ?? targetSizeSpec,
+        targetSizeSpec: targetSizeSpecEcho,
+        widthIn: round2(widthIn),
+        heightIn: round2(heightIn),
+        distanceYards: round2(distanceYards),
+        clickValueMoa: round2(clickValueMoa),
+        inchesPerClick: round2(inchesPerClick),
       },
     });
   } catch (err) {
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
-      build: "POIB_ANCHOR_V1",
-      error: { code: "SERVER_ERROR", message: err?.message || "Unknown error" },
+      service: 'sczn3-sec-backend-pipe',
+      build: BUILD,
+      error: {
+        code: 'SERVER_ERROR',
+        message: String(err && err.message ? err.message : err),
+      },
     });
   }
 });
 
+// Helpful message if someone GETs the POST route
+app.get('/api/sec', (req, res) => {
+  return res.status(405).json({
+    ok: false,
+    service: 'sczn3-sec-backend-pipe',
+    build: BUILD,
+    error: {
+      code: 'METHOD_NOT_ALLOWED',
+      message: 'Use POST /api/sec (multipart or JSON).',
+    },
+  });
+});
+
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`SCZN3 backend alive on port ${PORT} build=${BUILD}`);
+});
