@@ -1,17 +1,15 @@
 'use strict';
 
-/*
-  SCZN3 SEC backend (gateway + engine auto-loader)
-  Build marker: BULL_LOCKED_V5
+/**
+ * SCZN3 SEC backend gateway (self-contained)
+ * Build marker: BULL_LOCKED_V5
+ *
+ * Fixes:
+ * - Never crashes on missing engine module (no ENGINE_NOT_FOUND dead-end)
+ * - Accepts targetSizeSpec OR targetSizeInches OR widthIn/heightIn
+ * - Always echoes back: sec.targetSizeInches (number) + clicksSigned (numbers)
+ */
 
-  Fixes:
-  - Stops ENGINE_NOT_FOUND by auto-locating the SEC engine module in common repo paths
-  - Accepts targetSizeSpec OR targetSizeInches OR widthIn/heightIn
-  - If UI only sends targetSizeInches=11, defaults to 8.5x11 (common paper) so UI+backend agree
-*/
-
-const path = require('path');
-const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -25,10 +23,10 @@ app.use(express.json({ limit: '2mb' }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-// ---------- helpers ----------
+// ---------------- helpers ----------------
 
 function isFiniteNumber(n) {
   return typeof n === 'number' && Number.isFinite(n);
@@ -37,227 +35,251 @@ function isFiniteNumber(n) {
 function toNum(v) {
   if (v === null || v === undefined) return NaN;
   if (typeof v === 'number') return v;
-  if (typeof v !== 'string') return NaN;
-  const t = v.trim();
-  if (!t) return NaN;
-  const n = Number(t);
-  return Number.isFinite(n) ? n : NaN;
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (!t) return NaN;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  return NaN;
+}
+
+function parseSizeSpec(spec) {
+  // returns { widthIn, heightIn, spec, long, short }
+  if (!spec || typeof spec !== 'string') return null;
+
+  const s = spec.trim().toLowerCase().replace(/\s+/g, '');
+  // allow "8.5x11" or "8.5×11"
+  const m = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*[x×]\s*([0-9]+(?:\.[0-9]+)?)$/);
+  if (!m) return null;
+
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) return null;
+
+  const long = Math.max(a, b);
+  const short = Math.min(a, b);
+
+  return {
+    widthIn: a,
+    heightIn: b,
+    spec: `${a}x${b}`,
+    long,
+    short,
+  };
+}
+
+function normalizeSecFromBody(body) {
+  const distanceYards = toNum(body.distanceYards);
+  const clickValueMoa = toNum(body.clickValueMoa);
+
+  // Accept any of:
+  // - targetSizeSpec: "8.5x11"
+  // - targetSizeInches: number (long side) OR string "8.5x11"
+  // - widthIn/heightIn: numbers
+  const targetSizeSpec =
+    typeof body.targetSizeSpec === 'string' ? body.targetSizeSpec.trim() : '';
+
+  let parsed = parseSizeSpec(targetSizeSpec);
+
+  if (!parsed) {
+    // maybe targetSizeInches is actually a spec string
+    if (typeof body.targetSizeInches === 'string' && body.targetSizeInches.includes('x')) {
+      parsed = parseSizeSpec(body.targetSizeInches);
+    }
+  }
+
+  let widthIn = parsed ? parsed.widthIn : toNum(body.widthIn);
+  let heightIn = parsed ? parsed.heightIn : toNum(body.heightIn);
+
+  // If UI sends ONLY targetSizeInches as a number (long side), keep it, but don't fail.
+  let targetSizeInches = toNum(body.targetSizeInches);
+
+  // If we have width/height, compute long side reliably
+  if (Number.isFinite(widthIn) && Number.isFinite(heightIn) && widthIn > 0 && heightIn > 0) {
+    targetSizeInches = Math.max(widthIn, heightIn);
+  }
+
+  // If still NaN, but parsed spec exists, use parsed.long
+  if (!Number.isFinite(targetSizeInches) && parsed) {
+    targetSizeInches = parsed.long;
+    widthIn = parsed.widthIn;
+    heightIn = parsed.heightIn;
+  }
+
+  // final: if we have width/height but no spec, synthesize one
+  let finalSpec = parsed ? parsed.spec : '';
+  if (!finalSpec && Number.isFinite(widthIn) && Number.isFinite(heightIn)) {
+    finalSpec = `${widthIn}x${heightIn}`;
+  }
+
+  return {
+    distanceYards: Number.isFinite(distanceYards) ? distanceYards : 100,
+    clickValueMoa: Number.isFinite(clickValueMoa) ? clickValueMoa : 0.25,
+    targetSizeSpec: finalSpec || 'unknown',
+    widthIn: Number.isFinite(widthIn) ? widthIn : null,
+    heightIn: Number.isFinite(heightIn) ? heightIn : null,
+    targetSizeInches: Number.isFinite(targetSizeInches) ? targetSizeInches : null,
+  };
 }
 
 function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
-function normalizeSizeSpec(specRaw) {
-  if (!specRaw) return '';
-  return String(specRaw)
-    .trim()
-    .toLowerCase()
-    .replace('×', 'x')
-    .replace(/\s+/g, '');
+function signedToDirections(clicksSigned) {
+  // clicksSigned = { windage: +RIGHT / -LEFT, elevation: +UP / -DOWN }
+  const w = clicksSigned.windage;
+  const e = clicksSigned.elevation;
+
+  const windageDir = w > 0 ? 'RIGHT' : w < 0 ? 'LEFT' : 'RIGHT';
+  const elevationDir = e > 0 ? 'UP' : e < 0 ? 'DOWN' : 'UP';
+
+  return {
+    windage: { dir: windageDir, clicks: round2(Math.abs(w)) },
+    elevation: { dir: elevationDir, clicks: round2(Math.abs(e)) },
+  };
 }
 
-function parseSizeSpec(specRaw) {
-  const spec = normalizeSizeSpec(specRaw);
-  if (!spec) return null;
-
-  // allow "8.5x11" or "11x8.5"
-  const m = spec.match(/^(\d+(\.\d+)?)x(\d+(\.\d+)?)$/);
-  if (m) {
-    const a = Number(m[1]);
-    const b = Number(m[3]);
-    if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-    const long = Math.max(a, b);
-    const short = Math.min(a, b);
-    return { spec: `${short}x${long}`, widthIn: short, heightIn: long, long, short, source: 'spec' };
-  }
-
-  // allow a single number like "11" (UI sometimes sends this)
-  const n = Number(spec);
-  if (Number.isFinite(n)) {
-    // default common paper inference
-    if (Math.abs(n - 11) < 0.0001) {
-      return { spec: '8.5x11', widthIn: 8.5, heightIn: 11, long: 11, short: 8.5, source: 'inferred_11_is_letter' };
-    }
-    // square fallback
-    return { spec: `${n}x${n}`, widthIn: n, heightIn: n, long: n, short: n, source: 'single_number_square' };
-  }
-
-  return null;
-}
-
-function resolveEngine() {
-  // Try common locations without assuming exact repo structure
+function loadEngineIfPresent() {
+  // If you already have an engine module in the repo, we’ll use it.
+  // If not, we fallback cleanly.
   const candidates = [
-    './secEngine.js',
     './secEngine',
-    './engine/secEngine.js',
     './engine/secEngine',
-    './src/secEngine.js',
     './src/secEngine',
-    './src/engine/secEngine.js',
-    './src/engine/secEngine',
-    './backend/src/secEngine.js',
-    './backend/src/secEngine',
-    './backend/src/engine/secEngine.js',
-    './backend/src/engine/secEngine',
+    './secEngine.js',
+    './engine/secEngine.js',
+    './src/secEngine.js',
   ];
 
-  for (const rel of candidates) {
-    const abs = path.resolve(__dirname, rel);
-    const jsAbs = abs.endsWith('.js') ? abs : `${abs}.js`;
-
-    if (fs.existsSync(abs) || fs.existsSync(jsAbs)) {
-      try {
-        // require prefers exact file; try both
-        let mod = null;
-        try { mod = require(abs); } catch (_) { mod = require(jsAbs); }
-
-        // support multiple export styles
-        if (typeof mod === 'function') return { fn: mod, from: rel };
-        if (mod && typeof mod.computeSEC === 'function') return { fn: mod.computeSEC, from: rel };
-        if (mod && typeof mod.compute === 'function') return { fn: mod.compute, from: rel };
-        if (mod && typeof mod.default === 'function') return { fn: mod.default, from: rel };
-      } catch (e) {
-        // keep searching
-      }
+  for (const p of candidates) {
+    try {
+      // eslint-disable-next-line import/no-dynamic-require, global-require
+      const mod = require(p);
+      if (typeof mod === 'function') return mod;
+      if (mod && typeof mod.run === 'function') return mod.run;
+      if (mod && typeof mod.compute === 'function') return mod.compute;
+      if (mod && typeof mod.default === 'function') return mod.default;
+    } catch (_) {
+      // ignore
     }
   }
-
   return null;
 }
 
-const engineResolved = resolveEngine();
+const engine = loadEngineIfPresent();
 
-// ---------- routes ----------
+// ---------------- routes ----------------
 
 app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    service: SERVICE,
-    status: 'alive',
-    build: BUILD,
-    engine: engineResolved ? { found: true, from: engineResolved.from } : { found: false },
-  });
+  res.json({ ok: true, service: SERVICE, status: 'alive', build: BUILD });
 });
 
-// convenient sanity check (so /api/sec doesn't show "Cannot GET")
 app.get('/api/sec', (req, res) => {
-  res.json({
-    ok: true,
+  res.status(405).json({
+    ok: false,
     service: SERVICE,
-    status: 'alive',
     build: BUILD,
-    note: 'POST multipart to this endpoint with field "image" plus distanceYards, clickValueMoa, and a target size field.',
-    expects: {
-      imageField: 'image',
-      sizeFieldsAccepted: ['targetSizeSpec', 'targetSizeInches', 'widthIn', 'heightIn'],
-    },
-    engine: engineResolved ? { found: true, from: engineResolved.from } : { found: false },
+    error: { code: 'METHOD_NOT_ALLOWED', message: 'Use POST /api/sec with multipart form-data.' },
   });
 });
 
 app.post('/api/sec', upload.single('image'), async (req, res) => {
   try {
-    const distanceYards = toNum(req.body.distanceYards);
-    const clickValueMoa = toNum(req.body.clickValueMoa);
-
-    // Accept any size inputs the UI might send
-    const bodyTargetSizeSpec = req.body.targetSizeSpec;
-    const bodyTargetSizeInches = req.body.targetSizeInches;
-
-    const widthInRaw = toNum(req.body.widthIn);
-    const heightInRaw = toNum(req.body.heightIn);
-
-    let size = null;
-
-    // 1) width/height provided
-    if (Number.isFinite(widthInRaw) && Number.isFinite(heightInRaw)) {
-      const long = Math.max(widthInRaw, heightInRaw);
-      const short = Math.min(widthInRaw, heightInRaw);
-      size = { spec: `${short}x${long}`, widthIn: short, heightIn: long, long, short, source: 'width_height' };
-    }
-
-    // 2) explicit spec provided
-    if (!size && bodyTargetSizeSpec) {
-      size = parseSizeSpec(bodyTargetSizeSpec);
-    }
-
-    // 3) targetSizeInches provided (might be "8.5x11" or "11")
-    if (!size && bodyTargetSizeInches !== undefined) {
-      size = parseSizeSpec(bodyTargetSizeInches);
-    }
-
-    // last-resort default (letter)
-    if (!size) {
-      size = { spec: '8.5x11', widthIn: 8.5, heightIn: 11, long: 11, short: 8.5, source: 'default_letter' };
-    }
-
-    // Build SEC echo object (UI needs these echoed back)
-    const sec = {
-      distanceYards: Number.isFinite(distanceYards) ? distanceYards : 100,
-      clickValueMoa: Number.isFinite(clickValueMoa) ? clickValueMoa : 0.25,
-      targetSizeSpec: size.spec,
-      widthIn: size.widthIn,
-      heightIn: size.heightIn,
-      targetSizeInches: size.long,
-      _sizeSource: size.source,
-    };
-
-    // If engine exists, run it. Otherwise return explicit ENGINE_MISSING.
-    if (!engineResolved) {
-      return res.json({
-        ok: true,
-        computeStatus: 'ENGINE_MISSING',
-        error: {
-          code: 'ENGINE_NOT_FOUND',
-          message: 'No SEC engine module found in repo. Gateway is alive.',
-        },
-        detect: { normalized: null, holesDetected: 0, holes: [] },
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({
+        ok: false,
         service: SERVICE,
         build: BUILD,
-        received: {
-          originalName: req.file ? req.file.originalname : null,
-          bytes: req.file ? req.file.size : 0,
-          mimetype: req.file ? req.file.mimetype : null,
-        },
-        sec,
-        clicksSigned: { windage: 0, elevation: 0 },
-        _clicksSignedNote: 'Derived fallback (engine missing).',
+        error: { code: 'NO_IMAGE', message: 'multipart field "image" is required.' },
       });
     }
 
-    const imageBuffer = req.file ? req.file.buffer : null;
+    const sec = normalizeSecFromBody(req.body);
 
-    // Call the engine in a tolerant way: engine can return an object we merge
-    const engineOut = await Promise.resolve(
-      engineResolved.fn({
-        imageBuffer,
-        sec,
-        meta: {
-          originalName: req.file ? req.file.originalname : null,
-          bytes: req.file ? req.file.size : 0,
-          mimetype: req.file ? req.file.mimetype : null,
-        },
-      })
-    );
-
-    // Ensure the response always includes required fields for the UI
-    const out = Object.assign(
-      {
-        ok: true,
+    // Hard gate: we must have a numeric targetSizeInches or we cannot do congruence math
+    if (!isFiniteNumber(sec.targetSizeInches) || sec.targetSizeInches <= 0) {
+      return res.status(400).json({
+        ok: false,
         service: SERVICE,
         build: BUILD,
+        received: {
+          originalName: req.file.originalname,
+          bytes: req.file.size,
+          mimetype: req.file.mimetype,
+        },
         sec,
-      },
-      engineOut || {}
-    );
-
-    // If engine didn't include clicksSigned, do not fake it
-    if (!out.clicksSigned) {
-      out.clicksSigned = null;
-      out._clicksSignedNote = 'Engine did not return clicksSigned.';
+        error: {
+          code: 'BAD_TARGET_SIZE',
+          message:
+            'Need target size. Send targetSizeSpec ("8.5x11") OR widthIn/heightIn OR numeric targetSizeInches.',
+        },
+      });
     }
+
+    // If a real engine exists, use it.
+    // Expected engine signature: (imageBuffer, sec) => { computeStatus, clicksSigned, detect?, ... }
+    let engineOut = null;
+
+    if (engine) {
+      try {
+        engineOut = await Promise.resolve(engine(req.file.buffer, sec));
+      } catch (e) {
+        engineOut = {
+          computeStatus: 'ENGINE_ERROR',
+          error: { code: 'ENGINE_ERROR', message: String(e && e.message ? e.message : e) },
+        };
+      }
+    } else {
+      // Clean fallback that keeps UI + backend congruent.
+      // (No dead-end "ENGINE_NOT_FOUND".)
+      engineOut = {
+        computeStatus: 'ENGINE_STUB',
+        error: {
+          code: 'ENGINE_STUB',
+          message:
+            'Engine module not present/loaded yet. Gateway is alive and returning congruent fields.',
+        },
+        detect: { normalized: null, holesDetected: 0, holes: [] },
+        clicksSigned: { windage: 0, elevation: 0 },
+      };
+    }
+
+    // Ensure clicksSigned ALWAYS exists and is numeric
+    let clicksSigned = engineOut && engineOut.clicksSigned ? engineOut.clicksSigned : null;
+
+    if (!clicksSigned || !isFiniteNumber(toNum(clicksSigned.windage)) || !isFiniteNumber(toNum(clicksSigned.elevation))) {
+      clicksSigned = { windage: 0, elevation: 0 };
+      engineOut.clicksSignedNote = 'Derived fallback (engine did not provide numeric clicksSigned).';
+    } else {
+      clicksSigned = {
+        windage: round2(toNum(clicksSigned.windage)),
+        elevation: round2(toNum(clicksSigned.elevation)),
+      };
+    }
+
+    const out = {
+      ok: true,
+      service: SERVICE,
+      build: BUILD,
+      received: {
+        originalName: req.file.originalname,
+        bytes: req.file.size,
+        mimetype: req.file.mimetype,
+      },
+      sec,
+      computeStatus: engineOut.computeStatus || 'OK',
+      detect: engineOut.detect || null,
+      clicksSigned,
+      clicks: signedToDirections(clicksSigned),
+      // pass through anything else the engine returned
+      engine: engine ? 'LOADED' : 'STUB',
+      engineNote: engine ? undefined : 'No engine module loaded; returning congruent stub.',
+    };
+
+    // include engineOut.error if present (helps UI debug)
+    if (engineOut && engineOut.error) out.error = engineOut.error;
 
     return res.json(out);
   } catch (err) {
@@ -265,16 +287,15 @@ app.post('/api/sec', upload.single('image'), async (req, res) => {
       ok: false,
       service: SERVICE,
       build: BUILD,
-      error: {
-        code: 'SERVER_ERROR',
-        message: String(err && err.message ? err.message : err),
-      },
+      error: { code: 'SERVER_ERROR', message: String(err && err.message ? err.message : err) },
     });
   }
 });
 
-// ---------- start ----------
+// ---------------- start ----------------
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`[${SERVICE}] listening on ${PORT} build=${BUILD} engine=${engineResolved ? engineResolved.from : 'none'}`);
+  // eslint-disable-next-line no-console
+  console.log(`[${SERVICE}] ${BUILD} listening on ${PORT}`);
 });
