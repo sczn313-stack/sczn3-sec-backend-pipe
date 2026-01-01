@@ -1,13 +1,9 @@
 {
-  "targetSizeSpec": "8.5x11",
+  "targetSize": "8.5x11",
   "distanceYards": 100,
   "clickValueMoa": 0.25,
-  "deadbandInches": 0.10,
-  "bull": { "x": 4.25, "y": 5.50 },
-  "holes": [
-    { "x": 3.82, "y": 4.88 },
-    { "x": 3.90, "y": 4.79 },
-    { "x": 3.86, "y": 4.84 }
-  ],
-  "frontendBuild": "FE_NO_DEMO_V1_2025-12-31_1635"
+  "deadbandInches": 0.1,
+  "bullX": 4.25,
+  "bullY": 5.5,
+  "holes": [{"x":3.9,"y":4.8},{"x":3.95,"y":4.78}]
 }
