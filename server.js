@@ -1,109 +1,104 @@
-/* server.js - SCZN3 SEC backend (single-file, copy/paste)
-   Supports:
-   - GET  /            -> status JSON
-   - GET  /health      -> status JSON
-   - GET  /api/sec     -> METHOD_NOT_ALLOWED + example
-   - POST /api/sec     -> compute clicks using inches-only
-     Accepts JSON or multipart/form-data with:
-       - payload: JSON string
-       - image: optional file (ignored for now)
-*/
+// server.js  (REPLACE THE WHOLE FILE)
+// SCZN3 SEC Backend (PIPE) — POIB → BULL, Y axis = DOWN (screen coords), clicks output as RIGHT/LEFT + UP/DOWN
+//
+// Endpoints:
+//   GET  /            -> alive JSON
+//   GET  /health      -> alive JSON
+//   POST /api/sec     -> compute from holes[] or poib{}, returns scopeClicks
+//
+// Payload (POST /api/sec):
+// {
+//   "targetSize": "8.5x11",
+//   "distanceYards": 100,
+//   "clickValueMoa": 0.25,
+//   "deadbandInches": 0.10,
+//   "bullX": 4.25,
+//   "bullY": 5.50,
+//   "holes": [{"x":3.9,"y":4.8},{"x":3.95,"y":4.78}]
+//   // OR: "poib": {"x":3.94,"y":4.80}
+// }
 
 const express = require("express");
 const cors = require("cors");
-const multer = require("multer");
-
-const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
 
 const SERVICE_NAME = "sczn3-sec-backend-pipe";
 const BUILD = "POIB_TO_BULL_TRUE_MOA_TAP_HOLES_V2__YDOWN__ELEV_UP_WHEN_POIB_BELOW";
-const Y_AXIS_USED = "down";
 
-app.use(cors());
+const app = express();
+
+// ---- CORS + JSON parsing ----
+app.use(cors({ origin: true, methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type"] }));
+app.options("*", cors());
 app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+
+// ---- helpers ----
+function num(v) {
+  if (v === null || v === undefined) return NaN;
+  const n = typeof v === "string" ? Number(v.trim()) : Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
 
 function round2(n) {
-  return Math.round((Number(n) || 0) * 100) / 100;
+  return Math.round(n * 100) / 100;
 }
 
-function asNum(v, fallback) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
+function meanPoint(holes) {
+  let sx = 0, sy = 0, c = 0;
+  for (const h of holes) {
+    const x = num(h?.x);
+    const y = num(h?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    sx += x; sy += y; c++;
+  }
+  if (c === 0) return null;
+  return { x: sx / c, y: sy / c };
 }
 
-function parseTargetSize(sizeStr) {
-  const s = String(sizeStr || "").toLowerCase().trim();
-  const m = s.match(/^(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)$/);
-  if (!m) return { widthIn: 8.5, heightIn: 11 };
-  return { widthIn: Number(m[1]), heightIn: Number(m[2]) };
+// Y axis used: "down" (increasing y = moving DOWN on the screen/paper image)
+function quadrantFromDeltas(dx, dy) {
+  // dx: + means POIB RIGHT of bull
+  // dy: + means POIB BELOW bull (because Y is down)
+  if (dx < 0 && dy < 0) return "UL";
+  if (dx > 0 && dy < 0) return "UR";
+  if (dx < 0 && dy > 0) return "LL";
+  if (dx > 0 && dy > 0) return "LR";
+  if (dx === 0 && dy === 0) return "CENTER";
+  if (dx === 0) return dy < 0 ? "UP" : "DOWN";
+  if (dy === 0) return dx < 0 ? "LEFT" : "RIGHT";
+  return "UNKNOWN";
 }
 
-function computePoibFromHoles(holes) {
-  const pts = Array.isArray(holes) ? holes : [];
-  const clean = pts
-    .map((p) => ({
-      x: Number(p && p.x),
-      y: Number(p && p.y),
-    }))
-    .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+function labelFromSignedWindage(w) {
+  if (!Number.isFinite(w) || w === 0) return "0.00 clicks";
+  return w > 0 ? `RIGHT ${round2(Math.abs(w))} clicks` : `LEFT ${round2(Math.abs(w))} clicks`;
+}
 
-  if (clean.length === 0) return null;
+function labelFromSignedElevation(e) {
+  if (!Number.isFinite(e) || e === 0) return "0.00 clicks";
+  return e > 0 ? `UP ${round2(Math.abs(e))} clicks` : `DOWN ${round2(Math.abs(e))} clicks`;
+}
 
-  const sx = clean.reduce((a, p) => a + p.x, 0);
-  const sy = clean.reduce((a, p) => a + p.y, 0);
-
+// ---- alive endpoints ----
+function aliveJson() {
   return {
-    x: sx / clean.length,
-    y: sy / clean.length,
-    n: clean.length,
+    ok: true,
+    service: SERVICE_NAME,
+    status: "alive",
+    build: BUILD,
+    yAxisUsed: "down",
+    hint: "Use GET /health or POST /api/sec"
   };
 }
 
-function labelWindageFromDx(dxIn) {
-  // dx = poib.x - bullX
-  // if POIB is LEFT of bull (dx < 0), dial RIGHT
-  // if POIB is RIGHT of bull (dx > 0), dial LEFT
-  if (dxIn < 0) return "RIGHT";
-  if (dxIn > 0) return "LEFT";
-  return "NONE";
-}
+app.get("/", (req, res) => res.json(aliveJson()));
+app.get("/health", (req, res) => res.json(aliveJson()));
 
-function labelElevationFromDy(dyIn) {
-  // Y axis is DOWN
-  // dy = poib.y - bullY
-  // if POIB is BELOW bull (dy > 0), dial UP
-  // if POIB is ABOVE bull (dy < 0), dial DOWN
-  if (dyIn > 0) return "UP";
-  if (dyIn < 0) return "DOWN";
-  return "NONE";
-}
-
-function makeStatus(extra) {
-  return Object.assign(
-    {
-      ok: true,
-      service: SERVICE_NAME,
-      status: "alive",
-      build: BUILD,
-      yAxisUsed: Y_AXIS_USED,
-      hint: "Use GET /health or POST /api/sec",
-    },
-    extra || {}
-  );
-}
-
-app.get("/", (req, res) => res.json(makeStatus({ path: "/" })));
-app.get("/health", (req, res) => res.json(makeStatus({ path: "/health" })));
-
+// ---- guard GET on compute route ----
 app.get("/api/sec", (req, res) => {
   return res.status(405).json({
     ok: false,
     error: "METHOD_NOT_ALLOWED",
     message: "Use POST /api/sec",
-    build: BUILD,
-    yAxisUsed: Y_AXIS_USED,
     example: {
       targetSize: "8.5x11",
       distanceYards: 100,
@@ -111,134 +106,114 @@ app.get("/api/sec", (req, res) => {
       deadbandInches: 0.1,
       bullX: 4.25,
       bullY: 5.5,
-      holes: [{ x: 3.9, y: 4.8 }],
-    },
+      holes: [{ x: 3.9, y: 4.8 }]
+    }
   });
 });
 
-app.post("/api/sec", upload.single("image"), (req, res) => {
+// ---- compute ----
+app.post("/api/sec", (req, res) => {
   try {
-    let body = req.body || {};
+    const b = req.body || {};
 
-    // Accept multipart with `payload` JSON string
-    if (typeof body.payload === "string") {
-      try {
-        body = JSON.parse(body.payload);
-      } catch {
-        return res.status(400).json({
-          ok: false,
-          error: "BAD_PAYLOAD",
-          message: "payload must be valid JSON",
-          build: BUILD,
-          yAxisUsed: Y_AXIS_USED,
-        });
-      }
+    const targetSize = (b.targetSize || "8.5x11").toString();
+    const distanceYards = num(b.distanceYards);
+    const clickValueMoa = num(b.clickValueMoa);
+    const deadbandInches = num(b.deadbandInches);
+
+    const bullX = num(b.bullX);
+    const bullY = num(b.bullY);
+
+    const holes = Array.isArray(b.holes) ? b.holes : null;
+    const poibIn = b.poib && typeof b.poib === "object" ? { x: num(b.poib.x), y: num(b.poib.y) } : null;
+
+    if (!Number.isFinite(distanceYards) || distanceYards <= 0) {
+      return res.status(400).json({ ok: false, error: "BAD_INPUT", message: "distanceYards must be a positive number.", build: BUILD, yAxisUsed: "down" });
+    }
+    if (!Number.isFinite(clickValueMoa) || clickValueMoa <= 0) {
+      return res.status(400).json({ ok: false, error: "BAD_INPUT", message: "clickValueMoa must be a positive number (e.g., 0.25).", build: BUILD, yAxisUsed: "down" });
+    }
+    if (!Number.isFinite(deadbandInches) || deadbandInches < 0) {
+      return res.status(400).json({ ok: false, error: "BAD_INPUT", message: "deadbandInches must be >= 0.", build: BUILD, yAxisUsed: "down" });
+    }
+    if (!Number.isFinite(bullX) || !Number.isFinite(bullY)) {
+      return res.status(400).json({ ok: false, error: "BAD_INPUT", message: "Provide bullX and bullY (numbers).", build: BUILD, yAxisUsed: "down" });
     }
 
-    const targetSize = body.targetSize || "8.5x11";
-    const size = parseTargetSize(targetSize);
-
-    const distanceYards = asNum(body.distanceYards, null);
-    const clickValueMoa = asNum(body.clickValueMoa, null);
-    const deadbandInches = asNum(body.deadbandInches, 0);
-
-    const bullX = asNum(body.bullX, null);
-    const bullY = asNum(body.bullY, null);
-
-    let poib = body.poib && typeof body.poib === "object" ? body.poib : null;
-    const holes = Array.isArray(body.holes) ? body.holes : null;
-
-    if (!poib && holes) {
-      const poibFromHoles = computePoibFromHoles(holes);
-      if (poibFromHoles) poib = { x: poibFromHoles.x, y: poibFromHoles.y };
+    // Determine POIB
+    let poib = null;
+    if (poibIn && Number.isFinite(poibIn.x) && Number.isFinite(poibIn.y)) {
+      poib = poibIn;
+    } else if (holes) {
+      poib = meanPoint(holes);
     }
 
-    if (
-      distanceYards == null ||
-      clickValueMoa == null ||
-      bullX == null ||
-      bullY == null ||
-      !poib ||
-      !Number.isFinite(Number(poib.x)) ||
-      !Number.isFinite(Number(poib.y))
-    ) {
+    if (!poib) {
       return res.status(400).json({
         ok: false,
         error: "MISSING_INPUT",
-        message:
-          "Provide poib{x,y} or holes[], plus bullX, bullY, distanceYards, clickValueMoa. deadbandInches optional.",
+        message: "Provide holes[] or poib{}.",
         build: BUILD,
-        yAxisUsed: Y_AXIS_USED,
+        yAxisUsed: "down"
       });
     }
 
-    const poibX = Number(poib.x);
-    const poibY = Number(poib.y);
+    // True MOA at distance: 1.047" at 100y
+    const inchesPerMOA = (distanceYards / 100) * 1.047;
+    const inchesPerClick = inchesPerMOA * clickValueMoa;
 
-    const dxIn = poibX - bullX; // + means POIB right of bull
-    const dyIn = poibY - bullY; // + means POIB below bull (Y down)
+    // Deltas in inches (Y axis DOWN):
+    // dx: + means POIB is RIGHT of bull
+    // dy: + means POIB is BELOW bull
+    const dxIn = poib.x - bullX;
+    const dyIn = poib.y - bullY;
 
     // deadband
     const dxAdj = Math.abs(dxIn) < deadbandInches ? 0 : dxIn;
     const dyAdj = Math.abs(dyIn) < deadbandInches ? 0 : dyIn;
 
-    // inches per MOA at distance (1.047" at 100y)
-    const inchesPerMOA = (distanceYards / 100) * 1.047;
-    const inchesPerClick = inchesPerMOA * clickValueMoa;
-
-    const windageDir = labelWindageFromDx(dxAdj);
-    const elevationDir = labelElevationFromDy(dyAdj);
-
-    const windageClicksAbs = inchesPerClick === 0 ? 0 : Math.abs(dxAdj) / inchesPerClick;
-    const elevationClicksAbs = inchesPerClick === 0 ? 0 : Math.abs(dyAdj) / inchesPerClick;
-
-    // Signed convention: positive means RIGHT/UP; negative means LEFT/DOWN
-    const windageSigned =
-      windageDir === "RIGHT" ? windageClicksAbs : windageDir === "LEFT" ? -windageClicksAbs : 0;
-
-    const elevationSigned =
-      elevationDir === "UP" ? elevationClicksAbs : elevationDir === "DOWN" ? -elevationClicksAbs : 0;
+    // Signed clicks where:
+    //   windageSigned > 0 => RIGHT
+    //   elevationSigned > 0 => UP
+    //
+    // If POIB is RIGHT (dxAdj > 0), to move POIB to bull you dial LEFT => negative.
+    // If POIB is BELOW (dyAdj > 0), to move POIB to bull you dial UP   => positive.
+    const windageSigned = dxAdj === 0 ? 0 : -(dxAdj / inchesPerClick);
+    const elevationSigned = dyAdj === 0 ? 0 : (dyAdj / inchesPerClick);
 
     const out = {
       ok: true,
       service: SERVICE_NAME,
-      status: "alive",
       build: BUILD,
-      yAxisUsed: Y_AXIS_USED,
 
+      // keep your axis convention explicit
+      yAxisUsed: "down",
+
+      // numeric outputs (2 decimals)
       clicksSigned: {
         windage: round2(windageSigned),
-        elevation: round2(elevationSigned),
+        elevation: round2(elevationSigned)
       },
 
+      // human-readable
       scopeClicks: {
-        windage:
-          windageDir === "NONE"
-            ? "NONE 0.00 clicks"
-            : `${windageDir} ${round2(windageClicksAbs)} clicks`,
-        elevation:
-          elevationDir === "NONE"
-            ? "NONE 0.00 clicks"
-            : `${elevationDir} ${round2(elevationClicksAbs)} clicks`,
+        windage: labelFromSignedWindage(windageSigned),
+        elevation: labelFromSignedElevation(elevationSigned)
       },
 
+      // helpful debug (you can remove later)
       debug: {
         targetSize,
-        targetSizeInches: size,
         distanceYards,
         clickValueMoa,
         deadbandInches,
         inchesPerMOA: round2(inchesPerMOA),
         inchesPerClick: round2(inchesPerClick),
         bull: { x: bullX, y: bullY },
-        poib: { x: round2(poibX), y: round2(poibY) },
-        dxIn: round2(dxIn),
-        dyIn: round2(dyIn),
-        dxAdj: round2(dxAdj),
-        dyAdj: round2(dyAdj),
-        hasImage: !!req.file,
-        holesCount: Array.isArray(holes) ? holes.length : 0,
-      },
+        poib: { x: round2(poib.x), y: round2(poib.y) },
+        deltasInches: { dx: round2(dxIn), dy: round2(dyIn) },
+        poibQuad: quadrantFromDeltas(dxIn, dyIn)
+      }
     };
 
     return res.json(out);
@@ -248,12 +223,12 @@ app.post("/api/sec", upload.single("image"), (req, res) => {
       error: "SERVER_ERROR",
       message: err && err.message ? err.message : "Unknown server error",
       build: BUILD,
-      yAxisUsed: Y_AXIS_USED,
+      yAxisUsed: "down"
     });
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[${SERVICE_NAME}] listening on ${PORT} :: ${BUILD}`);
+  console.log(`[${SERVICE_NAME}] listening on ${PORT} :: build=${BUILD}`);
 });
