@@ -1,242 +1,240 @@
-/**
- * SCZN3 Backend (Pipe) — server.js
- * Convention LOCKED:
- *  - X increases to the RIGHT
- *  - Y increases DOWN the page (top=0)
- *  - clicksSigned:
- *      windage  + = RIGHT,  - = LEFT
- *      elevation+ = UP,     - = DOWN
- *
- * So:
- *  dx = poib.x - bull.x   ( + means POIB right of bull )
- *  dy = poib.y - bull.y   ( + means POIB below bull )
- *
- * Needed correction (move POIB to bull):
- *  windageSigned   = -dx / inchesPerClick   (right if POIB is left)
- *  elevationSigned =  dy / inchesPerClick   (up if POIB is low)
- */
+// server.js  (REPLACE THE WHOLE FILE)
+// SCZN3 SEC backend — POIB -> Bull, Y axis is DOWN (top=0, bottom=+)
+// Elevation: dy>0 (POIB below bull) => UP. dy<0 => DOWN.
 
 const express = require("express");
 const cors = require("cors");
 
 const app = express();
 
-const SERVICE_NAME = "sczn3-sec-backend-pipe";
-const BUILD = process.env.BUILD_TAG || "POIB_TO_BULL_YDOWN_LOCKED_V4";
-const Y_AXIS_USED = "down"; // locked
+app.use(cors({ origin: "*" }));
+app.use(express.json({ limit: "2mb" }));
 
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: "5mb" }));
+const SERVICE_NAME = process.env.SERVICE_NAME || "sczn3-sec-backend-pipe";
+const BUILD =
+  process.env.BUILD ||
+  "POIB_TO_BULL_TRUE_MOA_TAP_HOLES_V2__YDOWN__ELEV_UP_WHEN_POIB_BELOW";
 
-// ---------- helpers ----------
-function isNum(n) {
-  return typeof n === "number" && Number.isFinite(n);
+const round2 = (n) => Math.round(n * 100) / 100;
+
+function safeNum(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-function round2(n) {
-  return Math.round(n * 100) / 100;
+// Quadrant is based on dx,dy where:
+// dx = poib.x - bull.x  ( + = POIB right of bull )
+// dy = poib.y - bull.y  ( + = POIB below bull because Y increases downward )
+function getQuadrant(dx, dy) {
+  if (dx === 0 && dy === 0) return "C";
+  const xSide = dx <= 0 ? "L" : "R";
+  const ySide = dy <= 0 ? "U" : "L";
+  // ySide 'U' means above bull (dy<=0), 'L' means below bull (dy>0)
+  return ySide + xSide; // "UL","UR","LL","LR"
 }
 
-function clampMin(n, min) {
-  return n < min ? min : n;
+function labelWindageFromSigned(w) {
+  if (w === 0) return "HOLD";
+  return w > 0 ? "RIGHT" : "LEFT";
+}
+
+function labelElevationFromSigned(e) {
+  if (e === 0) return "HOLD";
+  return e > 0 ? "UP" : "DOWN";
+}
+
+function normalizeTargetSizeSpec(specRaw) {
+  const spec = String(specRaw || "").trim();
+  // Keep it simple: accept "8.5x11", "8.5×11", "8.5 x 11"
+  const cleaned = spec.replace("×", "x").replace(/\s+/g, "");
+  return cleaned || "8.5x11";
+}
+
+function sizeToInches(spec) {
+  // Only a couple needed for now — add more later if you want
+  // Returns widthIn, heightIn, longIn, shortIn
+  switch (spec) {
+    case "8.5x11":
+    case "8.5x11.0":
+      return { widthIn: 8.5, heightIn: 11, longIn: 11, shortIn: 8.5 };
+    case "11x8.5":
+      return { widthIn: 11, heightIn: 8.5, longIn: 11, shortIn: 8.5 };
+    default:
+      // If unknown, don't guess — fall back to 8.5x11 so math stays stable.
+      return { widthIn: 8.5, heightIn: 11, longIn: 11, shortIn: 8.5 };
+  }
 }
 
 function computePOIBFromHoles(holes) {
-  const xs = holes.map((h) => h.x);
-  const ys = holes.map((h) => h.y);
-  const x = xs.reduce((a, b) => a + b, 0) / xs.length;
-  const y = ys.reduce((a, b) => a + b, 0) / ys.length;
-  return { x, y };
+  // holes: [{x,y},...], inches
+  let sx = 0;
+  let sy = 0;
+  for (const h of holes) {
+    sx += h.x;
+    sy += h.y;
+  }
+  return { x: sx / holes.length, y: sy / holes.length };
 }
 
-function getQuadrant(dx, dy) {
-  // dy<0 = above bull; dy>0 = below bull (because Y increases DOWN)
-  if (dx < 0 && dy < 0) return "UL";
-  if (dx > 0 && dy < 0) return "UR";
-  if (dx < 0 && dy > 0) return "LL";
-  if (dx > 0 && dy > 0) return "LR";
-  // axis-aligned cases:
-  if (dx === 0 && dy < 0) return "U";
-  if (dx === 0 && dy > 0) return "D";
-  if (dx < 0 && dy === 0) return "L";
-  if (dx > 0 && dy === 0) return "R";
-  return "CENTER";
+function uniqQuadrants(holes, bull) {
+  const set = new Set();
+  for (const h of holes) {
+    const dx = h.x - bull.x;
+    const dy = h.y - bull.y;
+    set.add(getQuadrant(dx, dy));
+  }
+  return Array.from(set);
 }
 
-function labelFromSignedWindage(w) {
-  if (w > 0) return "RIGHT";
-  if (w < 0) return "LEFT";
-  return "HOLD";
+function validateHolesArray(v) {
+  if (!Array.isArray(v) || v.length === 0) return null;
+  const out = [];
+  for (const item of v) {
+    if (!item || typeof item !== "object") continue;
+    const x = Number(item.x);
+    const y = Number(item.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push({ x, y });
+  }
+  return out.length ? out : null;
 }
 
-function labelFromSignedElevation(e) {
-  if (e > 0) return "UP";
-  if (e < 0) return "DOWN";
-  return "HOLD";
-}
+// --- Routes ---
 
-// ---------- routes ----------
-app.get("/", (_req, res) => {
-  // so you never see "Cannot GET /" again
+app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: SERVICE_NAME,
+    status: "alive",
     build: BUILD,
-    yAxisUsed: Y_AXIS_USED,
+    yAxisUsed: "down",
     hint: "Use GET /health or POST /api/sec",
-    status: "alive",
   });
 });
 
-app.get("/health", (_req, res) => {
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: SERVICE_NAME,
+    status: "alive",
+    build: BUILD,
+    yAxisUsed: "down",
+  });
+});
+
+// Optional: GET to show hint (prevents confusion like "Cannot GET /api/sec")
+app.get("/api/sec", (req, res) => {
   res.json({
     ok: true,
     service: SERVICE_NAME,
     build: BUILD,
-    yAxisUsed: Y_AXIS_USED,
-    status: "alive",
+    yAxisUsed: "down",
+    hint: "POST JSON with holes[] or poib{}, plus bullX/bullY, distanceYards, clickValueMoa, deadbandInches, targetSize",
   });
 });
 
-// Helpful guard (people keep opening /api/sec in a browser)
-app.get("/api/sec", (_req, res) => {
-  res.status(405).json({
-    ok: false,
-    error: "METHOD_NOT_ALLOWED",
-    message: "Use POST /api/sec (JSON body).",
-  });
-});
-
-/**
- * POST /api/sec
- * Accepts either:
- *  A) holes: [{x,y}, ...]  (inches)
- *  OR
- *  B) poib: {x,y}          (inches)
- *
- * Required:
- *  bull: {x,y} (inches)
- *  distanceYards (number)
- *  clickValueMoa (number) e.g. 0.25
- *
- * Optional:
- *  deadbandInches (number) default 0
- *  targetSizeSpec (string) (e.g., "8.5x11")
- *  targetSizeInches: {widthIn,heightIn,longIn,shortIn}
- */
 app.post("/api/sec", (req, res) => {
   try {
     const body = req.body || {};
 
-    const distanceYards = Number(body.distanceYards);
-    const clickValueMoa = Number(body.clickValueMoa);
-    const deadbandInches = body.deadbandInches == null ? 0 : Number(body.deadbandInches);
+    const targetSizeSpec = normalizeTargetSizeSpec(body.targetSize || body.targetSizeSpec);
+    const targetSizeInches = sizeToInches(targetSizeSpec);
 
-    const bull = body.bull || {};
-    const bullX = Number(bull.x);
-    const bullY = Number(bull.y);
+    const distanceYards = safeNum(body.distanceYards, 100);
+    const clickValueMoa = safeNum(body.clickValueMoa, 0.25);
+    const deadbandInches = safeNum(body.deadbandInches, 0.1);
 
-    if (!isNum(distanceYards) || distanceYards <= 0) {
-      return res.status(400).json({ ok: false, error: "BAD_DISTANCE_YARDS" });
-    }
-    if (!isNum(clickValueMoa) || clickValueMoa <= 0) {
-      return res.status(400).json({ ok: false, error: "BAD_CLICK_VALUE_MOA" });
-    }
-    if (!isNum(bullX) || !isNum(bullY)) {
-      return res.status(400).json({ ok: false, error: "BAD_BULL" });
-    }
-    if (!isNum(deadbandInches) || deadbandInches < 0) {
-      return res.status(400).json({ ok: false, error: "BAD_DEADBAND" });
-    }
+    const bullX = safeNum(body.bullX, 4.25);
+    const bullY = safeNum(body.bullY, 5.5);
 
-    let holes = null;
+    const bull = { x: bullX, y: bullY };
+
+    // Input: either holes[] or poib{}
+    const holes = validateHolesArray(body.holes);
     let poib = null;
 
-    if (Array.isArray(body.holes) && body.holes.length > 0) {
-      // validate holes
-      const cleaned = [];
-      for (const h of body.holes) {
-        if (!h || typeof h !== "object") continue;
-        const x = Number(h.x);
-        const y = Number(h.y);
-        if (isNum(x) && isNum(y)) cleaned.push({ x, y });
-      }
-      if (cleaned.length === 0) {
-        return res.status(400).json({ ok: false, error: "BAD_HOLES" });
-      }
-      holes = cleaned;
-      poib = computePOIBFromHoles(cleaned);
+    if (holes && holes.length) {
+      poib = computePOIBFromHoles(holes);
     } else if (body.poib && typeof body.poib === "object") {
-      const x = Number(body.poib.x);
-      const y = Number(body.poib.y);
-      if (!isNum(x) || !isNum(y)) {
-        return res.status(400).json({ ok: false, error: "BAD_POIB" });
-      }
-      poib = { x, y };
-    } else {
+      const px = Number(body.poib.x);
+      const py = Number(body.poib.y);
+      if (Number.isFinite(px) && Number.isFinite(py)) poib = { x: px, y: py };
+    }
+
+    if (!poib) {
       return res.status(400).json({
         ok: false,
         error: "MISSING_INPUT",
         message: "Provide holes[] or poib{}.",
+        build: BUILD,
+        yAxisUsed: "down",
       });
     }
 
-    // inches per MOA at distance (1.047" @ 100y)
+    // Inches per MOA at distance (1.047" @ 100y)
     const inchesPerMOA = (distanceYards / 100) * 1.047;
     const inchesPerClick = inchesPerMOA * clickValueMoa;
 
-    const dxIn = poib.x - bullX; // + = POIB right
-    const dyIn = poib.y - bullY; // + = POIB below (Y down)
+    // dx,dy in inches using Y-down coordinate system
+    const dxIn = poib.x - bull.x; // + = POIB right of bull
+    const dyIn = poib.y - bull.y; // + = POIB below bull (because Y grows downward)
 
-    // Apply deadband (inches) — if within deadband, treat as 0
+    // Apply deadband: if within deadband, treat as 0 adjustment on that axis
     const dxAdj = Math.abs(dxIn) < deadbandInches ? 0 : dxIn;
     const dyAdj = Math.abs(dyIn) < deadbandInches ? 0 : dyIn;
 
-    // Signed clicks (LOCKED convention)
-    const windageSigned = dxAdj === 0 ? 0 : (-dxAdj / inchesPerClick);
-    const elevationSigned = dyAdj === 0 ? 0 : (dyAdj / inchesPerClick);
+    // Signed clicks convention (LOCKED):
+    // windageSigned > 0 => RIGHT, < 0 => LEFT
+    // elevationSigned > 0 => UP,    < 0 => DOWN
+    //
+    // With Y-down: if dyAdj > 0 (POIB below bull), correction is UP => positive
+    // so elevationSigned = dyAdj / inchesPerClick
+    const windageSigned = inchesPerClick === 0 ? 0 : dxAdj / inchesPerClick;
+    const elevationSigned = inchesPerClick === 0 ? 0 : dyAdj / inchesPerClick;
 
-    const windageLabel = labelFromSignedWindage(windageSigned);
-    const elevationLabel = labelFromSignedElevation(elevationSigned);
+    const windageLabel = labelWindageFromSigned(windageSigned);
+    const elevationLabel = labelElevationFromSigned(elevationSigned);
 
     const windageClicksAbs = Math.abs(windageSigned);
     const elevationClicksAbs = Math.abs(elevationSigned);
 
-    const poibQuad = getQuadrant(dxIn === 0 ? 0 : dxIn, dyIn === 0 ? 0 : dyIn);
+    const poibQuad = getQuadrant(dxIn, dyIn);
+    const uniqueHoleQuadrants = holes ? uniqQuadrants(holes, bull) : [];
 
     const out = {
       ok: true,
       service: SERVICE_NAME,
       build: BUILD,
 
+      // keep shape: positive means RIGHT/UP, negative means LEFT/DOWN
       clicksSigned: {
-        // keep your historical shape: positive means RIGHT / UP
-        windage: round2(windageClicksAbs * (windageSigned < 0 ? -1 : 1)),
-        elevation: round2(elevationClicksAbs * (elevationSigned < 0 ? -1 : 1)),
+        windage: round2(windageSigned),
+        elevation: round2(elevationSigned),
       },
 
+      // readable scope output (ALWAYS matches signed clicks)
       scopeClicks: {
         windage: `${windageLabel} ${round2(windageClicksAbs)} clicks`,
         elevation: `${elevationLabel} ${round2(elevationClicksAbs)} clicks`,
       },
 
       debug: {
-        yAxisUsed: Y_AXIS_USED,
+        yAxisUsed: "down",
+        targetSizeSpec,
+        targetSizeInches,
         distanceYards,
         clickValueMoa,
-        deadbandInches,
         inchesPerMOA: round2(inchesPerMOA),
         inchesPerClick: round2(inchesPerClick),
-        bull: { x: bullX, y: bullY },
-        poib: { x: round2(poib.x), y: round2(poib.y) },
+        bull,
+        poib,
+        holesUsedCount: holes ? holes.length : 0,
         dxIn: round2(dxIn),
         dyIn: round2(dyIn),
         poibQuad,
-        holesUsedCount: holes ? holes.length : 0,
-        targetSizeSpec: body.targetSizeSpec || null,
-        targetSizeInches: body.targetSizeInches || null,
+        uniqueHoleQuadrants,
         note:
-          "LOCKED: X right, Y down. Windage: POIB left=>RIGHT (+). Elevation: POIB low=>UP (+).",
+          "Convention locked: X right+, Y down+. dy>0 means POIB below bull => elevation UP. Quadrants: UL(dx-,dy-), UR(dx+,dy-), LL(dx-,dy+), LR(dx+,dy+).",
       },
     };
 
@@ -246,11 +244,13 @@ app.post("/api/sec", (req, res) => {
       ok: false,
       error: "SERVER_ERROR",
       message: err && err.message ? err.message : "Unknown error",
+      build: BUILD,
+      yAxisUsed: "down",
     });
   }
 });
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[${SERVICE_NAME}] listening on ${PORT} | build=${BUILD} | yAxisUsed=${Y_AXIS_USED}`);
+  console.log(`[${SERVICE_NAME}] listening on ${PORT} :: ${BUILD}`);
 });
