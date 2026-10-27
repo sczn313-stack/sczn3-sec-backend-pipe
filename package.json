@@ -1,9 +1,17 @@
 {
-  "targetSize": "8.5x11",
-  "distanceYards": 100,
-  "clickValueMoa": 0.25,
-  "deadbandInches": 0.1,
-  "bullX": 4.25,
-  "bullY": 5.5,
-  "holes": [{"x":3.9,"y":4.8},{"x":3.95,"y":4.78}]
+  "name": "sczn3-sec-backend-pipe",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.23.4 <23"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "2.8.5",
+    "express": "4.22.1"
+  }
 }

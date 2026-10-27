@@ -1,0 +1,9 @@
+{
+  "targetSize": "8.5x11",
+  "distanceYards": 100,
+  "clickValueMoa": 0.25,
+  "deadbandInches": 0.1,
+  "bullX": 4.25,
+  "bullY": 5.5,
+  "holes": [{"x":3.9,"y":4.8},{"x":3.95,"y":4.78}]
+}
