@@ -12,6 +12,8 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: security/node22-2026-10-27
       - uses: actions/setup-node@v4
         with:
           node-version: '22.23.4'
